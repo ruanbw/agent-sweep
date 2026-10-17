@@ -135,8 +135,20 @@ type Service struct {
 	guardLocal bool
 }
 
+// NewService 生产入口：应用数据目录固定为真实用户目录。
+//
+// 测试不要直接用它再改字段 —— 那样 cleaner 仍指向真实的 backups/journal。
+// 需要隔离时用 NewServiceWith(version, t.TempDir())。
 func NewService(version string) *Service {
-	appDir := catalog.AppDir()
+	return NewServiceWith(version, catalog.AppDir())
+}
+
+// NewServiceWith 用调用方给定的应用数据目录构造服务。
+//
+// appDir 是所有落盘状态的唯一根：prefs、icons、cleaner 的 backups/journal、
+// 以及 updateCache 都在这里一次算出来。构造之后这些依赖不再读
+// catalog.AppDir()，所以传入临时目录就得到一个完全不碰用户数据的实例。
+func NewServiceWith(version, appDir string) *Service {
 	svc := &Service{
 		version:     version,
 		appDir:      appDir,
