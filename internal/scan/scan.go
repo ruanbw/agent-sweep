@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -300,7 +301,7 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=query_only(1)")
+	db, err := sql.Open("sqlite", sqliteDSN(dbPath))
 	if err != nil {
 		return nil, err
 	}
@@ -363,6 +364,21 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+// sqliteDSN 拼出 `file:<path>?mode=ro&_pragma=query_only(1)`。
+//
+// 路径只做 EscapedPath（空格 → %20，`?`、`#`、`%` 也一并转义），绝不把裸路径
+// 直接拼进 `file:` URI：`?` / `#` 在 macOS 上是完全合法的文件名字符，裸拼会让
+// URI 被截断或改变语义 —— 轻则打开到另一个文件，重则直接打不开，而上层会把
+// 它记成错误或「0 条会话」。
+//
+// 写法与 internal/probe 的 sqliteReadOnlyDSN 对齐（同样只转义 path、不用
+// url.URL.String() 生成 file:/// 三斜杠形态）；两个包各留一份，不跨包导出。
+// 本包不加 busy_timeout，那是另一条修复。
+func sqliteDSN(path string) string {
+	escaped := (&url.URL{Path: filepath.ToSlash(path)}).EscapedPath()
+	return "file:" + escaped + "?mode=ro&_pragma=query_only(1)"
 }
 
 // sqliteTime 认现代c 驱动返回的几种时间形态。
