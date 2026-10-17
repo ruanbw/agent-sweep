@@ -499,7 +499,7 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 			continue
 		}
 		addNotice(&notices, scanNotice{
-			key:  "column:" + store.Table + ":" + choice.role + ":" + choice.name,
+			key:  "column:" + store.Table + ":" + choice.role + ":" + choice.name + ":" + choice.preferred,
 			text: choice.warning(store.Table),
 		})
 	}

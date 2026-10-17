@@ -145,6 +145,7 @@ func TestAssocRejectsEscapingPatterns(t *testing.T) {
 	}{
 		{"相对路径上跳", "../../outside", outsideFromRelative},
 		{"数据根相对上跳", "/../outside", outsideFromRooted},
+		{"绝对路径上跳", "/../../outside", outsideFromRelative},
 		{"双斜杠绝对绕法", "//../../outside", outsideFromRelative},
 	}
 	for _, c := range cases {
