@@ -154,12 +154,18 @@ func AllWithProgress(specs []catalog.Spec, progress func(done, total int, curren
 			defer func() { <-sem }()
 			results[i] = One(spec)
 			if progress != nil {
+				// 回调在持锁期间调用：只保证 done 递增还不够 —— 解锁后再调
+				// 回调，多个 goroutine 之间会出现「先到 3/30、再到 2/30」的
+				// 倒序。这里串行化的是 UI 侧的短操作（每完成一个 Agent 才调
+				// 一次，回调本身只更新进度字段），牺牲的并发可以忽略，换来
+				// 「n 永远不倒退」的接口保证。
+				//
+				// 回调里不要再拿这把 mu，否则自锁。
 				mu.Lock()
 				done++
-				current := spec.Name
-				n := done
-				mu.Unlock()
+				n, current := done, spec.Name
 				progress(n, total, current)
+				mu.Unlock()
 			}
 		}(i, spec)
 	}
@@ -167,9 +173,31 @@ func AllWithProgress(specs []catalog.Spec, progress func(done, total int, curren
 	return results
 }
 
+// scanStoreFn 是 One 调用 scanStore 的间接层，只给测试替换用（故意不导出）。
+//
+// 测试需要构造「某个 Agent 的 Store 解析 panic」与「完成顺序可控」两种场景，
+// 而真实的 scanStore 没法稳定制造 panic。生产路径永远指向 scanStore。
+var scanStoreFn = scanStore
+
 // One 扫描单个 Agent。
-func One(spec catalog.Spec) AgentResult {
-	result := AgentResult{
+//
+// 返回值必须命名：defer 里的 recover 要能改到即将返回的 result。扫描是只读
+// 操作，但解析畸形文件会走到解析器与驱动深处，一个没预料到的 panic 不该让
+// 整个进程退出 —— CLI `agentsweep scan` 直接调 scan.All，没有 GUI 那层兜底。
+func One(spec catalog.Spec) (result AgentResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			// 已经扫到的 Sessions 保留：用户至少能看到部分结果，Err 负责说明
+			// 这份结果不完整。panic 到这里为止，不再向上抛。
+			message := fmt.Sprintf("扫描 %s 时发生 panic：%v", spec.Name, recovered)
+			if result.Err != "" {
+				result.Err += "; " + message
+			} else {
+				result.Err = message
+			}
+		}
+	}()
+	result = AgentResult{
 		AgentID: spec.ID,
 		Name:    spec.Name,
 		Group:   string(spec.Group),
@@ -200,7 +228,7 @@ func One(spec catalog.Spec) AgentResult {
 	// 同一个 sessionId 可能在多个 Store 里出现（Claude Code 的 projects/ 与 sessions/）。
 	// 先到先得：Store 的声明顺序就是优先级。
 	for _, store := range spec.Stores {
-		items, err := scanStore(spec, home, store)
+		items, err := scanStoreFn(spec, home, store)
 		var noticeErr *scanNoticeError
 		if errors.As(err, &noticeErr) {
 			for _, notice := range noticeErr.notices {
