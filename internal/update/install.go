@@ -454,7 +454,7 @@ func validateArchitecture(appDir string) error {
 	if runtime.GOOS != "darwin" {
 		return nil
 	}
-	lipo, err := exec.LookPath("lipo")
+	lipo, err := resolveTool("lipo")
 	if err != nil {
 		return nil
 	}
@@ -493,10 +493,14 @@ func bundleVersion(appDir string) (string, error) {
 		}
 	}
 	if runtime.GOOS == "darwin" {
-		output, err := exec.Command("plutil", "-extract", "CFBundleShortVersionString", "raw", "-o", "-", plistPath).Output()
-		if err == nil {
-			if version := strings.TrimSpace(string(output)); version != "" {
-				return version, nil
+		// plutil 只用来读二进制 plist；找不到或执行失败都维持「读不到版本」的
+		// 既有语义，由调用方决定是跳过还是报错，不在这里 panic。
+		if plutil, err := resolveTool("plutil"); err == nil {
+			output, err := exec.Command(plutil, "-extract", "CFBundleShortVersionString", "raw", "-o", "-", plistPath).Output()
+			if err == nil {
+				if version := strings.TrimSpace(string(output)); version != "" {
+					return version, nil
+				}
 			}
 		}
 	}
@@ -511,9 +515,65 @@ func bundleVersion(appDir string) (string, error) {
 // 而安装路径恰好最不能容忍「测到的不是跑到的」。
 type commandFunc func(name string, args ...string) ([]byte, error)
 
+// systemToolDirs 是解析安装工具时的固定查找顺序。
+//
+// 这些目录在 macOS 上由系统拥有，普通用户改不动；PATH 则可能被 shell 配置、
+// CI 环境或父进程注入。安装流程会替换 /Applications 里的 .app，是应用里
+// 权限最高的动作，不能因为 PATH 里排前面的同名程序就换一个执行。
+var systemToolDirs = []string{"/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+
+// resolveTool 把工具名解析成绝对路径。
+//
+// 优先在系统固定目录里找，最后才回退 PATH：固定目录覆盖 macOS 的全部安装
+// 工具，PATH 回退只是给非 macOS 或自定义环境留的出口（例如开发机把工具装
+// 在 /opt/homebrew/bin）。回退仍然保留，是因为拒绝在 PATH 外找会把这些
+// 环境上的自动安装直接打死，收益不抵成本。
+func resolveTool(name string) (string, error) {
+	if strings.Contains(name, "/") {
+		// 调用方已经给了路径：不拼接、不猜，只校验它确实可执行。
+		if err := executableFile(name); err != nil {
+			return "", err
+		}
+		return name, nil
+	}
+	for _, dir := range systemToolDirs {
+		candidate := filepath.Join(dir, name)
+		if err := executableFile(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	if path, err := exec.LookPath(name); err == nil {
+		return path, nil
+	}
+	return "", fmt.Errorf("找不到可执行文件 %q：系统目录（%s）与 PATH 都没有", name, strings.Join(systemToolDirs, "、"))
+}
+
+// executableFile 检查 path 是否存在、是普通文件（非目录）且带执行位。
+func executableFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s 是目录", path)
+	}
+	if info.Mode()&0o111 == 0 {
+		return fmt.Errorf("%s 没有执行权限", path)
+	}
+	return nil
+}
+
 // runCommand 是生产路径上的实现。
+//
+// 先 resolveTool 再 exec：注入测试用的是逻辑名（"ditto"/"codesign"），
+// 而生产路径不允许裸名进 exec.Command —— 裸名会按调用方 PATH 解析，
+// 正是本函数要避开的那个洞。
 func runCommand(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).CombinedOutput()
+	resolved, err := resolveTool(name)
+	if err != nil {
+		return nil, err
+	}
+	return exec.Command(resolved, args...).CombinedOutput()
 }
 
 // commandFailure 拼出「哪条命令失败、为什么、命令自己说了什么」。
@@ -647,7 +707,7 @@ func removeOldBundle(oldPath string) error {
 // copyBundle 优先用 ditto：它保留资源分支、扩展属性与权限，签名才不会因为复制而失效。
 // run 让测试能替掉 ditto —— 测试里不执行任何真实外部命令。
 func copyBundle(source, destination string, run commandFunc) error {
-	if _, err := exec.LookPath("ditto"); err != nil {
+	if _, err := resolveTool("ditto"); err != nil {
 		return copyTree(source, destination)
 	}
 	output, err := run("ditto", source, destination)
@@ -756,7 +816,7 @@ func removeQuarantine(appDir string, run commandFunc) error {
 // 「签名有效」，只会让调用方误以为身份已经核验过。要提升保证，得换信任根
 // （Minisign/EdDSA 公钥，或 Developer ID + 公证），而不是在这里加料。
 func ensureSignature(appDir string) error {
-	if _, err := exec.LookPath("codesign"); err != nil {
+	if _, err := resolveTool("codesign"); err != nil {
 		return nil
 	}
 	return ensureSignatureWith(appDir, runCommand)
