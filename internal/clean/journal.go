@@ -127,6 +127,29 @@ func (c *Cleaner) Undo(batchID string) (UndoResult, error) {
 	if err != nil {
 		return UndoResult{Errors: []string{}}, err
 	}
+	// 撤销的可行性取决于「正文还能不能回来」，而不是 mode 的字面值：
+	//
+	//   - trash 批次：正文在废纸篓里，Moved 记录齐全，整批可逆。
+	//   - permanent 但 journal 里有 SQLite 备份：这类会话的正文就是库里的行，
+	//     journal 存了删行前的整库副本，整份覆盖回去即可完整恢复（正文与索引
+	//     一起回来），所以照旧允许。
+	//   - permanent 且没有任何 SQLite 备份：正文（jsonl / json / 目录）已经被
+	//     os.RemoveAll 永久删除，journal 里没有正文副本，能做的只是把索引备份
+	//     覆盖回去 —— 结果是「点进去是空」的幽灵会话，比不撤销更糟。拒绝。
+	//   - 未知 mode（包括旧 journal 里的空值）按最后一条处理：宁可给出明确
+	//     错误，也不要悄悄做一半。
+	//
+	// 校验放在任何磁盘操作和 j.Undone 标记之前，被拒绝时 journal 与用户数据
+	// 都不会被改动。
+	//
+	// 已知残留：混合批次（permanent 同时删掉文件型与 SQLite 型会话）因为
+	// len(j.SQLite) > 0 会放行，被删掉的文件正文不可恢复，索引还原后可能留下
+	// 幽灵条目。要精确判定得让 Delete 在 journal 里记录「永久删除的文件正文数」，
+	// 那是 schema 改动，留到后续单独做，这里不投机。
+	if j.Mode != ModeTrash && len(j.SQLite) == 0 {
+		return UndoResult{Errors: []string{}},
+			fmt.Errorf("clean: 批次 %s 的删除模式为 %q 且没有数据库备份，正文已永久删除；只有 trash 批次或带数据库备份的永久删除批次可以撤销", batchID, j.Mode)
+	}
 	out := UndoResult{Errors: []string{}}
 	if j.Undone {
 		return out, nil
