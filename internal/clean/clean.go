@@ -373,6 +373,9 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 
 	if len(deleted) > 0 {
 		c.trimIndexes(spec, home, deleted, j, &res, namer)
+		// 宿主数据根里的跨 Agent 索引（VS Code agent-host.db）：同一个
+		// deleted 集合，库在别的 Spec 下，所以单独一步。
+		c.trimSharedIndexes(spec, deleted, namer, j, &res)
 		if j.persistErr != nil {
 			return res, writer.failure(j.persistErr)
 		}
