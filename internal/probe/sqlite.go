@@ -96,13 +96,18 @@ func probeSQLite(path string, deadline time.Time) (hit *sqliteHit) {
 	}
 
 	hit = &sqliteHit{path: path, table: table, quality: tableScore}
-	columns, _ := tableColumns(ctx, db, table)
+	columns, err := tableColumns(ctx, db, table)
+	if err != nil {
+		// 读不到列信息就无法确定主键与展示列，草稿会变成一个「删不动的适配器」。
+		// 发现流程宁可漏报，也不能让用户保存一个用不了的声明 —— 这里直接放弃
+		// 这个候选，不产生半成品。
+		return nil
+	}
 	if id := firstPrimaryKey(columns); id != "" {
 		hit.idCol = id
 		hit.quality += 8 // 有主键才能安全删行，权重给得比展示列高
 	} else if id := firstNamedColumn(columns, idCandidates); id != "" {
 		// 不少工具用隐式 rowid，没有声明主键；退而求其次找常见 id 列。
-		// 都找不到就留空（草稿仍然可保存，用户可以在 UI 里补）。
 		hit.idCol = id
 		hit.quality += 3
 	}
@@ -120,7 +125,7 @@ func probeSQLite(path string, deadline time.Time) (hit *sqliteHit) {
 	}
 
 	// 行数用 LIMIT 子查询数：大表也只扫到 5001 行，够判断「有会话」了。
-	// 失败（比如表结构特殊/超时）就保留 0，不影响 sqlite 指纹本身成立。
+	// 失败（比如表结构特殊/超时）就保留 0，由下面的可用性判定把候选拒掉。
 	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM (SELECT 1 FROM %s LIMIT %d)",
 		quoteIdentifier(table), sessionRowLimit+1)
 	var count int
@@ -133,6 +138,26 @@ func probeSQLite(path string, deadline time.Time) (hit *sqliteHit) {
 		if count > 0 {
 			hit.quality += 2
 		}
+	}
+
+	// 三个条件同时满足才算「可用的会话表」，任一不满足就放弃这个候选：
+	//
+	//  1. 能确定 id 列（显式主键，或 idCandidates 命中）。没有它就无法定位
+	//     要删的行，草稿存下去也是个删不动的适配器。
+	//  2. 至少有一个展示/时间/路径列。只有 id 的表连标题都显示不出来，多半
+	//     不是会话存储 —— 普通应用的 messages(id, body) 正是典型。
+	//  3. rows > 0。空表没有任何会话，选它只会往发现页塞一条噪声候选；行数
+	//     查询失败也归到这里（无法证明有会话，就不要推荐）。
+	//
+	// 收紧的代价是可能少几个误报候选，收益是「发现的适配器保存后真的能用」。
+	if hit.idCol == "" {
+		return nil
+	}
+	if hit.titleCol == "" && hit.timeCol == "" && hit.cwdCol == "" {
+		return nil
+	}
+	if hit.rows == 0 {
+		return nil
 	}
 
 	return hit
