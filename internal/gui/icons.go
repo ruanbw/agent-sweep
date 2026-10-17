@@ -79,7 +79,7 @@ func (s *Service) handleIcon(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	spec, ok := catalog.Find(id)
+	spec, ok := s.iconSpec(id)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -96,6 +96,30 @@ func (s *Service) handleIcon(w http.ResponseWriter, r *http.Request) {
 	// 源图标变了会重新生成；浏览器缓存一小时足够减少重复请求。
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	http.ServeFile(w, r, path)
+}
+
+// iconSpec 选出用于生成图标的目录声明，优先用扫描时的快照。
+//
+// 为什么不再每次读 adapters.json：图标和删除必须基于同一份声明。扫描之后
+// 用户改了适配器时，如果图标请求重新读盘，就会出现「图标按新 spec 生成、
+// 删除按旧 spec 执行」——同一个 Agent 在两处被当成不同的东西。
+//
+// 唯一的例外是 s.specs 为空（服务刚启动、第一次扫描还没完成）：这时没有
+// 快照可查，回退到 catalog.Find 只是为了让图标先显示出来，扫描完成后自然
+// 走快照。快照非空但 id 不在其中时**不**回退：那说明它不在这次扫描的目录
+// 里，应当 404，而不是拿磁盘上的新目录去补。
+func (s *Service) iconSpec(id string) (catalog.Spec, bool) {
+	s.mu.Lock()
+	specs := s.specs
+	s.mu.Unlock()
+
+	if spec, ok := findSpec(specs, id); ok {
+		return spec, true
+	}
+	if len(specs) == 0 {
+		return catalog.Find(id)
+	}
+	return catalog.Spec{}, false
 }
 
 // ensure 把一个 .app 的图标转成 PNG 放进缓存。
