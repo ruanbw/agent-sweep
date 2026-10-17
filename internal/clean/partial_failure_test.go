@@ -68,18 +68,6 @@ func partialReadFile(t *testing.T, path string) string {
 	return string(data)
 }
 
-// writePartialFile 建好父目录后写一个小文件：用例里需要「父目录存在且可写」
-// 的文件，与「父目录不存在 / 不可写」的失败路径形成对照。
-func writePartialFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("MkdirAll(%s): %v", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("WriteFile(%s): %v", path, err)
-	}
-}
-
 func partialSession(id string, paths ...string) session.Session {
 	return session.Session{
 		ID:      id,
@@ -260,13 +248,13 @@ func TestDeletePermanentKeepsPerPathSemantics(t *testing.T) {
 	f := newPartialFixture(t, ModePermanent)
 
 	okPath := filepath.Join(f.home, "sessions", "ok", "session.jsonl")
-	writePartialFile(t, okPath, "ok\n")
+	partialWriteFile(t, okPath, "ok\n")
 	// 失败路径：文件躺在只读父目录里。RemoveAll 要 unlink，父目录没有写权限时
 	// 返回 EACCES —— 注意不能指望「父目录不存在」，那种情况下 RemoveAll 会直接
 	// 返回 nil（不存在 = 目标已达成），用例会假绿。
 	badDir := filepath.Join(f.home, "sessions", "bad")
 	badPath := filepath.Join(badDir, "session.jsonl")
-	writePartialFile(t, badPath, "bad\n")
+	partialWriteFile(t, badPath, "bad\n")
 	if err := os.Chmod(badDir, 0o555); err != nil {
 		t.Fatalf("Chmod(%s): %v", badDir, err)
 	}
@@ -295,5 +283,3 @@ func TestDeletePermanentKeepsPerPathSemantics(t *testing.T) {
 		t.Fatalf("permanent 模式不应写 moved 记录: %+v", j.Moved)
 	}
 }
-
-var _ = filepath.Separator
