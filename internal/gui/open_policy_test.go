@@ -116,6 +116,8 @@ func TestAllowedLocalPath(t *testing.T) {
 		{"会话路径的兄弟目录", filepath.Join(filepath.Dir(sessionDir), "demo2", "s1.jsonl"), false},
 		{"带 .. 的逃逸", filepath.Join(sessionDir, "..", "demo2", "s1.jsonl"), false},
 		{"会话文件再往上跳", filepath.Join(sessionFile, "..", "..", "demo2", "s1.jsonl"), false},
+		{".. 但仍在根内", filepath.Join(sessionDir, "nested", "..", "s1.jsonl"), true},
+		{"不存在的路径", filepath.Join(sessionDir, "missing.json"), false},
 		{"空串", "", false},
 		{"相对路径", "s1.jsonl", false},
 		{"GitHub URL 不是本地路径", "https://github.com/x", false},
@@ -153,7 +155,11 @@ func TestOpenHandlerRejectsOutsidePathWithoutExecuting(t *testing.T) {
 	svc, sessionFile, sessionDir, _ := openPolicyFixture(t)
 
 	link := filepath.Join(sessionDir, "escape")
-	if err := os.Symlink("/etc/passwd", link); err != nil {
+	outsideTarget := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outsideTarget, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideTarget, link); err != nil {
 		if runtime.GOOS == "windows" {
 			t.Skipf("当前平台不允许普通用户创建 symlink：%v", err)
 		}
