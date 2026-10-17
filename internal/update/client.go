@@ -35,6 +35,14 @@ const (
 	DefaultAPIBase = "https://api.github.com"
 )
 
+// maxDownloadBytes 是单个更新附件允许写入磁盘的最大字节数（512 MiB）。
+//
+// 为什么必须有这个数：ContentLength 和 asset.Size 都是远端自述的，一个恶意或
+// 异常的更新源可以声明「还有几十 GB」再慢慢喂，而旧实现只在写完之后才比对长度，
+// 磁盘早被填满了。正常 .app 发布包约 30–80 MB，512 MiB 留出六倍以上余量，
+// 既不会误伤未来的体积增长，又把「先写满磁盘再报不完整」的窗口压到有限大小。
+const maxDownloadBytes = 512 << 20
+
 // Asset 是发布附件。
 type Asset struct {
 	Name string `json:"name"`
@@ -484,6 +492,17 @@ func isHex(text string) bool {
 // 而「下到一半被整体超时掐断」对用户毫无解释力。安装调用方给的是一个 15 分钟的
 // context，真正的取消边界交给它。
 func (c *Client) Download(ctx context.Context, asset Asset, dest string, progress func(done, total int64)) error {
+	return c.downloadLimited(ctx, asset, dest, progress, maxDownloadBytes)
+}
+
+// downloadLimited 是 Download 的实现；limit 是本次允许落盘的最大字节数。
+//
+// 把 limit 做成参数而不是直接读常量，是为了能用很小的上限覆盖「超限中止」这条
+// 分支：真去流 512 MiB 才能测到它的话，测试既慢又平白占用磁盘。
+func (c *Client) downloadLimited(ctx context.Context, asset Asset, dest string, progress func(done, total int64), limit int64) error {
+	if limit <= 0 {
+		return fmt.Errorf("下载上限必须是正数（实际 %d 字节）", limit)
+	}
 	if asset.Name != filepath.Base(asset.Name) || strings.ContainsAny(asset.Name, `/\`) {
 		return fmt.Errorf("附件名不合法：%q", asset.Name)
 	}
@@ -508,6 +527,12 @@ func (c *Client) Download(ctx context.Context, asset Asset, dest string, progres
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("下载返回 %s", response.Status)
 	}
+	// 远端自述的长度先查一遍：声明就超限时既不建 .part，也不读 body。
+	// ContentLength 为 -1（chunked / 关闭连接定界）时跳过，交给下面的实读计数。
+	if response.ContentLength > limit {
+		return fmt.Errorf("下载未开始即中止：%s 声明 %d 字节（%s），超过单次下载上限 %d 字节（%s）",
+			asset.Name, response.ContentLength, describeBytes(response.ContentLength), limit, describeBytes(limit))
+	}
 
 	total := response.ContentLength
 	if total <= 0 {
@@ -519,12 +544,15 @@ func (c *Client) Download(ctx context.Context, asset Asset, dest string, progres
 		return err
 	}
 	writer := &progressWriter{writer: file, total: total, report: progress}
-	_, copyErr := io.CopyBuffer(writer, response.Body, make([]byte, 256<<10))
+	_, copyErr := copyDownloadBody(writer, response.Body, limit)
 	closeErr := file.Close()
 	if copyErr != nil {
 		_ = os.Remove(partial)
 		if ctx.Err() != nil {
 			return fmt.Errorf("下载中断：%w", ctx.Err())
+		}
+		if errors.Is(copyErr, errDownloadTooLarge) {
+			return fmt.Errorf("%s 下载中止：%w", asset.Name, copyErr)
 		}
 		return fmt.Errorf("下载中断：%w", copyErr)
 	}
@@ -540,6 +568,44 @@ func (c *Client) Download(ctx context.Context, asset Asset, dest string, progres
 		progress(writer.done, writer.total)
 	}
 	return os.Rename(partial, dest)
+}
+
+// errDownloadTooLarge 标记「响应体超过本次允许的字节数」，调用方据此给出大小相关的错误。
+var errDownloadTooLarge = errors.New("响应体超出大小限制")
+
+// copyDownloadBody 把 src 写进 dst，最多写入 limit 字节。
+//
+// 用 LimitReader 多读 1 字节来判断「还有没有更多」：既不会把超出上限的部分落盘，
+// 也不依赖 ContentLength —— 它可以缺失（-1），也可以撒谎。返回的 written 是实际
+// 写入 dst 的字节数；超限时它恰好是 limit+1。
+func copyDownloadBody(dst io.Writer, src io.Reader, limit int64) (int64, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("下载上限必须是正数（实际 %d 字节）", limit)
+	}
+	written, err := io.CopyBuffer(dst, io.LimitReader(src, limit+1), make([]byte, 256<<10))
+	if err != nil {
+		return written, err
+	}
+	if written > limit {
+		return written, fmt.Errorf("%w：上限 %d 字节（%s），已收到至少 %d 字节后中止",
+			errDownloadTooLarge, limit, describeBytes(limit), written)
+	}
+	return written, nil
+}
+
+// describeBytes 给错误文案补一个人看的单位；整数单位只在整除时才换算，
+// 避免「0.98 MiB」这种既是近似值又不好核对的说法。
+func describeBytes(size int64) string {
+	switch {
+	case size <= 0:
+		return "0 字节"
+	case size%(1<<20) == 0:
+		return fmt.Sprintf("%d MiB", size>>20)
+	case size%(1<<10) == 0:
+		return fmt.Sprintf("%d KiB", size>>10)
+	default:
+		return fmt.Sprintf("%d 字节", size)
+	}
 }
 
 // progressWriter 每 100ms 汇报一次，避免每个 256KB 块都触发一次 UI 更新。

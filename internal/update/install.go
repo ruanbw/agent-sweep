@@ -3,9 +3,12 @@ package update
 import (
 	"archive/zip"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -27,6 +30,14 @@ const maxExtractedBytes = 1 << 30
 
 // maxEntries 挡住「几万个空文件」这种解压放大。正常 .app 最多几千个条目。
 const maxEntries = 20000
+
+// relaunchCreateAttempts 是重启脚本文件名冲突时的总尝试次数。
+//
+// 第一次用确定的名字 relaunch-<pid>.sh，冲突（EEXIST，包括 symlink）之后换随机后缀。
+// 工作目录是用户缓存目录、路径可预测，本地攻击者能预先放一个同名 symlink 指向别处；
+// O_EXCL 保证我们绝不截断或跟随它，而每次创建都带 O_EXCL，所以即使随机后缀被猜中，
+// 也只会让我们再换一个名字，不会写到对手指定的路径。
+const relaunchCreateAttempts = 5
 
 // DetectBundle 从可执行文件位置反推 .app 路径。
 //
@@ -710,14 +721,8 @@ func ensureSignatureWith(appDir string, run commandFunc) error {
 // 为什么不在进程里直接 `open`：旧进程还占着窗口，新进程起来会两个图标并排；
 // 交给脚本等 PID 消失再启动，用户看到的是一次干净的重启。
 func RelaunchAfterExit(appPath string, pid int, workDir string) error {
-	if workDir == "" {
-		workDir = DefaultWorkDir()
-	}
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		return err
-	}
-	scriptPath := filepath.Join(workDir, fmt.Sprintf("relaunch-%d.sh", pid))
-	if err := os.WriteFile(scriptPath, []byte(relaunchScript(appPath, pid)), 0o700); err != nil {
+	scriptPath, err := writeRelaunchScript(workDir, appPath, pid)
+	if err != nil {
 		return err
 	}
 	command := exec.Command("/bin/sh", scriptPath)
@@ -725,6 +730,74 @@ func RelaunchAfterExit(appPath string, pid int, workDir string) error {
 	command.Stdout = nil
 	command.Stderr = nil
 	return command.Start()
+}
+
+// writeRelaunchScript 用 O_EXCL 建脚本文件，返回最终落盘的路径。
+//
+// 为什么不能用 os.WriteFile：目标已存在时它会截断原有文件；如果那个路径被预先
+// 放成指向别处的 symlink，写入还会顺着链接落到 symlink 目标上（经典 symlink
+// attack）。工作目录在用户缓存目录里、名字又是可预测的 relaunch-<pid>.sh，
+// 所以这里只接受「我新建了这个文件」：O_CREATE|O_EXCL 让已存在的普通文件或
+// symlink 都变成 EEXIST，而不是一次静默覆盖。
+//
+// 冲突时的回退是换带随机后缀的新名字重试（最多 relaunchCreateAttempts 次）。
+// 只有 EEXIST 才重试：目录不可写、磁盘满之类换名字也没用，直接报错更诚实。
+func writeRelaunchScript(workDir string, appPath string, pid int) (string, error) {
+	if workDir == "" {
+		workDir = DefaultWorkDir()
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return "", err
+	}
+	body := []byte(relaunchScript(appPath, pid))
+	base := fmt.Sprintf("relaunch-%d", pid)
+	var lastErr error
+	for attempt := 0; attempt < relaunchCreateAttempts; attempt++ {
+		name := base + ".sh"
+		if attempt > 0 {
+			suffix, err := randomSuffix()
+			if err != nil {
+				return "", err
+			}
+			name = base + "-" + suffix + ".sh"
+		}
+		scriptPath := filepath.Join(workDir, name)
+		file, err := os.OpenFile(scriptPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+		if err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				lastErr = err
+				continue
+			}
+			return "", fmt.Errorf("创建重启脚本 %s 失败：%w", scriptPath, err)
+		}
+		if _, err := file.Write(body); err != nil {
+			file.Close()
+			_ = os.Remove(scriptPath)
+			return "", fmt.Errorf("写入重启脚本 %s 失败：%w", scriptPath, err)
+		}
+		if err := file.Close(); err != nil {
+			_ = os.Remove(scriptPath)
+			return "", fmt.Errorf("写入重启脚本 %s 失败：%w", scriptPath, err)
+		}
+		// 创建模式会受 umask 影响，这里再显式确认一次 0700：脚本里有可执行路径，
+		// 不该让同机其他用户读到或改到。
+		if err := os.Chmod(scriptPath, 0o700); err != nil {
+			_ = os.Remove(scriptPath)
+			return "", fmt.Errorf("设置重启脚本 %s 权限失败：%w", scriptPath, err)
+		}
+		return scriptPath, nil
+	}
+	return "", fmt.Errorf("在 %s 里创建重启脚本失败：连试 %d 个名字都已被占用（最后一个错误：%v）",
+		workDir, relaunchCreateAttempts, lastErr)
+}
+
+// randomSuffix 给脚本名一个本地攻击者猜不到的后缀。
+func randomSuffix() (string, error) {
+	var buffer [8]byte
+	if _, err := rand.Read(buffer[:]); err != nil {
+		return "", fmt.Errorf("生成重启脚本名的随机后缀失败：%w", err)
+	}
+	return hex.EncodeToString(buffer[:]), nil
 }
 
 // relaunchScript 单独拆出来是为了能测：路径必须正确转义，
