@@ -111,24 +111,40 @@ func One(spec catalog.Spec) AgentResult {
 	// 先到先得：Store 的声明顺序就是优先级。
 	for _, store := range spec.Stores {
 		items, err := scanStore(spec, home, store)
-		if err != nil {
-			result.Err = err.Error()
-			continue
-		}
-		for _, item := range items {
-			if seen[item.ID] {
-				continue
-			}
-			seen[item.ID] = true
-			result.Sessions = append(result.Sessions, item)
-			result.TotalBytes += item.Bytes
-		}
+		mergeStore(&result, seen, items, err)
 	}
 
 	sort.SliceStable(result.Sessions, func(i, j int) bool {
 		return result.Sessions[i].UpdatedAt.After(result.Sessions[j].UpdatedAt)
 	})
 	return result
+}
+
+// mergeStore 把一个 Store 的结果并入 result：先记错误，再收会话。
+//
+// scanStore 可能**同时**返回已解析出的会话和一个错误 —— scanSQLite 的结尾是
+// `return out, rows.Err()`：库被锁、IO 出错或库损坏时，rows 迭代到一半失败，
+// 但前面读出来的行仍然有效。早期版本在 err 非空时直接 continue，把这些会话
+// 连同结果一起丢掉，UI 就显示「已安装 · 0 条会话」。所以两条路都要走。
+//
+// 多个 Store 都报错时按声明顺序用 `; ` 拼接，后面的错误不覆盖前面的。
+// 去重仍是先到先得：seen 跨 Store 复用，第一个出现的会话（含它的 Bytes）胜出。
+func mergeStore(result *AgentResult, seen map[string]bool, items []session.Session, err error) {
+	if err != nil {
+		if result.Err != "" {
+			result.Err += "; " + err.Error()
+		} else {
+			result.Err = err.Error()
+		}
+	}
+	for _, item := range items {
+		if seen[item.ID] {
+			continue
+		}
+		seen[item.ID] = true
+		result.Sessions = append(result.Sessions, item)
+		result.TotalBytes += item.Bytes
+	}
 }
 
 func scanStore(spec catalog.Spec, home string, store catalog.Store) ([]session.Session, error) {
