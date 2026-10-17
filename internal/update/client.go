@@ -90,14 +90,17 @@ func NewClient(current string) *Client {
 	if repo == "" {
 		repo = Repo
 	}
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+	client := &Client{
 		APIBase:   strings.TrimRight(apiBase, "/"),
 		Repo:      repo,
 		GOOS:      runtime.GOOS,
 		GOARCH:    runtime.GOARCH,
 		UserAgent: "AgentSweep/" + current,
 	}
+	// 每一跳都用和附件 URL 相同的 host 白名单校验：GitHub 的下载入口会 302 到
+	// objects.githubusercontent.com，HttpClient 默认会安静跟随，必须显式接管。
+	client.HTTP = &http.Client{Timeout: 30 * time.Second, CheckRedirect: client.checkRedirect}
+	return client
 }
 
 // allowedAPIBase 只放行 https 与回环 http。明文远程地址等于把「谁来投毒更新」交给网络。
@@ -124,6 +127,118 @@ func isLoopbackHost(host string) bool {
 	return address != nil && address.IsLoopback()
 }
 
+// allowedAssetHosts 是发布 JSON 里的 URL 唯一允许的 host。
+//
+// 名单按实际发布链路定的，不是按「GitHub 有哪些域名」：
+//   - api.github.com：Latest 的元数据端点，发布 JSON 由它返回；
+//   - github.com：browser_download_url 的正规形状，Release 附件的入口；
+//   - release-assets.githubusercontent.com：现在 github.com 的附件入口会 302 到这里，
+//     安装包的实际字节由它返回（URL 上带短期签名参数）；
+//   - objects.githubusercontent.com：较早的附件重定向目标，老发布、缓存或
+//     不同地域仍可能返回它；
+//   - github-releases.githubusercontent.com：更早的附件域名，留着是为了不把
+//     历史版本更新打死。
+//
+// 刻意不用 *.githubusercontent.com：raw. / gist. / avatars. 同样是 GitHub 的域名，
+// 但它们承载的是任意仓库内容和用户头像，不是发布资产，放进来只会扩大攻击面。
+var allowedAssetHosts = map[string]struct{}{
+	"github.com":                            {},
+	"api.github.com":                        {},
+	"release-assets.githubusercontent.com":  {},
+	"objects.githubusercontent.com":         {},
+	"github-releases.githubusercontent.com": {},
+}
+
+// allowedAssetHostList 只用于错误文案，让用户一眼看到「拿到了哪个 host、允许哪些」。
+const allowedAssetHostList = "github.com、api.github.com、release-assets.githubusercontent.com、objects.githubusercontent.com、github-releases.githubusercontent.com"
+
+// allowedDownloadURL 校验一个从发布 JSON 里拿到的 URL（安装包、checksums.txt）。
+//
+// 只允许 https + 固定 host：远端 JSON 同时给出包地址和校验和，如果地址本身可以
+// 指向任意主机，那么「校验和匹配」只能证明下载到的东西和它自己声明的一致，
+// 不能证明来源可信。重定向目标由 checkRedirect 用同一套规则再查一遍。
+func allowedDownloadURL(raw string) error {
+	return validateUpdateURL(raw, false)
+}
+
+// validateUpdateURL 是策略本体。allowLoopback 只在 APIBase 本身是回环地址时打开
+// （httptest / 本地调试），见 (*Client).allowLoopbackAssets。
+func validateUpdateURL(raw string, allowLoopback bool) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("更新地址为空；只允许 https 的 GitHub 发布域名：%s", allowedAssetHostList)
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("更新地址无法解析（%v）；只允许 https 的 GitHub 发布域名：%s", err, allowedAssetHostList)
+	}
+	host := strings.ToLower(parsed.Hostname())
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && !(allowLoopback && scheme == "http" && isLoopbackHost(host)) {
+		return fmt.Errorf("更新地址的协议是 %q（host %q），不是 https；只允许 https 的 GitHub 发布域名：%s", scheme, host, allowedAssetHostList)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("更新地址的 host %q 带有用户信息，拒绝；只允许 https 的 GitHub 发布域名：%s", host, allowedAssetHostList)
+	}
+	if host == "" {
+		return fmt.Errorf("更新地址没有 host；只允许 https 的 GitHub 发布域名：%s", allowedAssetHostList)
+	}
+	if _, ok := allowedAssetHosts[host]; !ok {
+		if allowLoopback && isLoopbackHost(host) {
+			return nil
+		}
+		return fmt.Errorf("更新地址的 host 是 %q，不在允许名单内；只允许：%s", host, allowedAssetHostList)
+	}
+	// 固定 host 上再放开任意端口没有意义，只会给「同一主机上的别的服务」开门。
+	if port := parsed.Port(); port != "" && port != "443" {
+		return fmt.Errorf("更新地址的 host %q 使用了端口 %s，只允许 443", host, port)
+	}
+	return nil
+}
+
+// checkRedirect 是默认（不放开回环）的重定向守卫，拆成包级函数便于单测。
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	return checkRedirectWith(req, via, false)
+}
+
+func checkRedirectWith(req *http.Request, via []*http.Request, allowLoopback bool) error {
+	if req == nil || req.URL == nil {
+		return errors.New("更新下载的重定向缺少目标地址，已拒绝")
+	}
+	if len(via) >= 10 {
+		return fmt.Errorf("更新下载重定向超过 10 次，已停止（最后一跳 host %q）", req.URL.Hostname())
+	}
+	if err := validateUpdateURL(req.URL.String(), allowLoopback); err != nil {
+		source := "未知来源"
+		if len(via) > 0 && via[len(via)-1].URL != nil {
+			source = via[len(via)-1].URL.Hostname()
+		}
+		return fmt.Errorf("更新下载被重定向到不允许的地址（从 %q 跳到 %q）：%w", source, req.URL.Hostname(), err)
+	}
+	return nil
+}
+
+// allowLoopbackAssets 只有把 APIBase 指到回环地址时才放行回环 http 资产。
+//
+// 这正是 AGENTSWEEP_UPDATE_API_BASE 的测试/本地调试路径：元数据、安装包、
+// 校验文件全部来自本机 httptest。正式构建的 APIBase 是 api.github.com，
+// 这里返回 false，远端 JSON 里塞 127.0.0.1 不会变成 SSRF 通道。
+func (c *Client) allowLoopbackAssets() bool {
+	parsed, err := url.Parse(c.apiBase())
+	if err != nil || !isLoopbackHost(parsed.Hostname()) {
+		return false
+	}
+	return parsed.Scheme == "http" || parsed.Scheme == "https"
+}
+
+func (c *Client) validateAssetURL(raw string) error {
+	return validateUpdateURL(raw, c.allowLoopbackAssets())
+}
+
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	return checkRedirectWith(req, via, c.allowLoopbackAssets())
+}
+
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
@@ -132,13 +247,16 @@ func (c *Client) httpClient() *http.Client {
 }
 
 // downloadClient 复用同一个 Transport，但去掉整体超时：大文件由 context 限时。
+//
+// 重定向守卫必须在这里重新挂一次，而不是只依赖调用方注入的 HTTP：注入的 client
+// 可能自带一个宽松的 CheckRedirect，不能让它绕过附件 host 白名单。
 func (c *Client) downloadClient() *http.Client {
 	base := c.httpClient()
 	transport := base.Transport
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	return &http.Client{Transport: transport}
+	return &http.Client{Transport: transport, CheckRedirect: c.checkRedirect}
 }
 
 func (c *Client) apiBase() string {
@@ -329,12 +447,15 @@ func (c *Client) Checksums(ctx context.Context, release *Release) (map[string]st
 }
 
 func (c *Client) fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
+	if err := c.validateAssetURL(url); err != nil {
+		return nil, err
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	request.Header.Set("User-Agent", c.userAgent())
-	response, err := c.httpClient().Do(request)
+	response, err := c.downloadClient().Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -365,6 +486,11 @@ func isHex(text string) bool {
 func (c *Client) Download(ctx context.Context, asset Asset, dest string, progress func(done, total int64)) error {
 	if asset.Name != filepath.Base(asset.Name) || strings.ContainsAny(asset.Name, `/\`) {
 		return fmt.Errorf("附件名不合法：%q", asset.Name)
+	}
+	// 安装包地址来自远端 JSON，必须先过 host 白名单；重定向由 downloadClient
+	// 的 CheckRedirect 逐跳复查。
+	if err := c.validateAssetURL(asset.URL); err != nil {
+		return fmt.Errorf("安装包地址不可信：%w", err)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, asset.URL, nil)
 	if err != nil {
