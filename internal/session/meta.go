@@ -49,6 +49,52 @@ var nonUserRoles = map[string]bool{
 	"system": true, "developer": true, "tool": true, "function": true,
 }
 
+// mergeNodeBudget 是一次 merge 内所有 JSON 遍历共享的节点预算。
+//
+// 一次 merge 最多会做 4 次树遍历（标题、用户正文、深层标题、content 数组），
+// 而 deepUserText / deepTitle 只靠深度上限（8 / 6）兜底：每层最多展开 9 / 7
+// 个候选键，最坏情况是 9^8 ≈ 4300 万、7^6 ≈ 12 万次访问。会话头部又允许
+// 1MB 一行，扫描器同时跑 16 个文件 worker，一条畸形但合法的深宽记录就足以
+// 把 CPU 打到尖峰、让整个扫描长时间无响应。
+//
+// 4096 的依据：真实会话（Claude Code / Pi / DSH 等）一条记录通常只有几十个
+// 节点，即使整份会话是一个大 JSON 对象、含几百条消息，也远低于这个量级；
+// 同时它又比 1MB 单行常见的几万到几十万节点低一到两个数量级。预算按 merge
+// 共享（而不是每个函数各给一份），保证单条记录 4 次遍历的总访问量有上界。
+const mergeNodeBudget = 4096
+
+// budget 是遍历预算。left 是剩余节点数，used 只用于测试断言。
+// 预算耗尽不是错误：遍历就地停止，已收集到的内容照常返回，
+// 「解析失败退回 fallback」的语义不变。
+type budget struct {
+	left int
+	used int
+}
+
+func newBudget() *budget {
+	return &budget{left: mergeNodeBudget}
+}
+
+// spend 消耗一个节点并报告是否还能继续向下遍历。
+// nil 预算表示不限制，保留给直接调用内部函数的场景。
+func (b *budget) spend() bool {
+	if b == nil {
+		return true
+	}
+	if b.left <= 0 {
+		return false
+	}
+	b.left--
+	b.used++
+	return true
+}
+
+// exhausted 用于在宽数组 / 宽 map 的循环里尽早退出：
+// 预算耗尽后递归调用会立刻返回，但外层仍会把几万个元素挨个走完。
+func (b *budget) exhausted() bool {
+	return b != nil && b.left <= 0
+}
+
 // ReadMeta 读一个会话文件并抽元数据。
 //
 // 关键设计：**按需读，而不是固定读 64KB**。
@@ -235,6 +281,9 @@ func ParseJSONObject(head []byte) Meta {
 
 // merge 把一条记录里的字段并进结果。后到的只填空，不覆盖已有值。
 func (m *Meta) merge(obj map[string]any) {
+	// 一次 merge 的所有遍历共用这一份预算：4 次遍历各自从头上限的话，
+	// 单条记录的总开销仍会翻 4 倍，挡不住深宽 JSON。
+	b := newBudget()
 	role := roleOf(obj)
 
 	// 标题：先认显式标题字段，再退回消息正文。
@@ -247,21 +296,21 @@ func (m *Meta) merge(obj map[string]any) {
 		}
 	}
 	if m.Title == "" && !nonUserRoles[role] {
-		if text := contentText(contentOf(obj)); text != "" {
+		if text := contentText(contentOf(obj), b); text != "" {
 			m.Title = clean(text)
 		}
 	}
 	// 有些 Agent 把消息裹了好几层（DSH 是 data.inserted[].content[]）。
 	// 深搜一次找「第一条 role=user 的正文」，比给每家写一个结构解析器划算。
 	if m.Title == "" {
-		if text := deepUserText(obj, 0); text != "" {
+		if text := deepUserText(obj, 0, b); text != "" {
 			m.Title = clean(text)
 		}
 	}
 	// 还有一种：标题不在顶层，而在 payload.meta.title 这种包装层里
 	// （billion-context 就是）。只在还没标题时深搜，避免把内层工具消息当标题。
 	if m.Title == "" {
-		if text := deepTitle(obj, 0); text != "" {
+		if text := deepTitle(obj, 0, b); text != "" {
 			m.Title = clean(text)
 		}
 	}
@@ -316,7 +365,7 @@ func (m *Meta) merge(obj map[string]any) {
 	}
 
 	if m.Snippet == "" && !nonUserRoles[role] {
-		if text := contentText(contentOf(obj)); text != "" {
+		if text := contentText(contentOf(obj), b); text != "" {
 			m.Snippet = clean(text)
 		}
 	}
@@ -326,8 +375,8 @@ func (m *Meta) merge(obj map[string]any) {
 //
 // 与 deepUserText 分开：标题是「作者写的」，正文是「用户说的」，
 // 前者可信度高，所以先找标题；但两者都可能藏在包装层里。
-func deepTitle(value any, depth int) string {
-	if depth > 6 {
+func deepTitle(value any, depth int, b *budget) string {
+	if depth > 6 || !b.spend() {
 		return ""
 	}
 	switch v := value.(type) {
@@ -341,15 +390,21 @@ func deepTitle(value any, depth int) string {
 			}
 		}
 		for _, key := range []string{"payload", "meta", "data", "conversation", "session", "thread", "details"} {
+			if b.exhausted() {
+				return ""
+			}
 			if child, ok := v[key]; ok {
-				if text := deepTitle(child, depth+1); text != "" {
+				if text := deepTitle(child, depth+1, b); text != "" {
 					return text
 				}
 			}
 		}
 	case []any:
 		for _, item := range v {
-			if text := deepTitle(item, depth+1); text != "" {
+			if b.exhausted() {
+				return ""
+			}
+			if text := deepTitle(item, depth+1, b); text != "" {
 				return text
 			}
 		}
@@ -359,29 +414,35 @@ func deepTitle(value any, depth int) string {
 
 // deepUserText 在任意嵌套结构里找第一条 role=user 的正文。
 // 只认 user：system / tool 动辄几万字，当标题等于把提示词贴进列表。
-func deepUserText(value any, depth int) string {
-	if depth > 8 {
+func deepUserText(value any, depth int, b *budget) string {
+	if depth > 8 || !b.spend() {
 		return ""
 	}
 	switch v := value.(type) {
 	case map[string]any:
 		if role, _ := v["role"].(string); role == "user" {
 			for _, key := range []string{"content", "parts", "text", "message"} {
-				if text := contentText(v[key]); text != "" {
+				if text := contentText(v[key], b); text != "" {
 					return text
 				}
 			}
 		}
 		for _, key := range []string{"content", "parts", "message", "data", "inserted", "messages", "items", "payload", "event"} {
+			if b.exhausted() {
+				return ""
+			}
 			if child, ok := v[key]; ok {
-				if text := deepUserText(child, depth+1); text != "" {
+				if text := deepUserText(child, depth+1, b); text != "" {
 					return text
 				}
 			}
 		}
 	case []any:
 		for _, item := range v {
-			if text := deepUserText(item, depth+1); text != "" {
+			if b.exhausted() {
+				return ""
+			}
+			if text := deepUserText(item, depth+1, b); text != "" {
 				return text
 			}
 		}
@@ -437,13 +498,18 @@ func (m *Meta) mergeLoose(head []byte) {
 
 // contentText 把各种 content 形态压成纯文本：
 // 字符串、[{type:"text", text:"…"}]、{text:"…"}。
-func contentText(value any) string {
+// 数组可以非常宽（一条记录里塞几万个 content 块），所以逐项消耗预算；
+// 预算耗尽就带着已收集到的部分文本返回，不报错。
+func contentText(value any, b *budget) string {
 	switch v := value.(type) {
 	case string:
 		return strings.TrimSpace(v)
 	case []any:
 		var parts []string
 		for _, item := range v {
+			if !b.spend() {
+				break
+			}
 			if s, ok := item.(string); ok {
 				parts = append(parts, s)
 				continue
@@ -456,6 +522,9 @@ func contentText(value any) string {
 		}
 		return strings.TrimSpace(strings.Join(parts, " "))
 	case map[string]any:
+		if !b.spend() {
+			return ""
+		}
 		if text, ok := v["text"].(string); ok {
 			return strings.TrimSpace(text)
 		}
