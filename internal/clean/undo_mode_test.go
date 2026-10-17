@@ -56,6 +56,10 @@ func newUndoModeFixture(t *testing.T, mode string) *undoModeFixture {
 		BatchID: batchID,
 		At:      now,
 		Mode:    mode,
+		// Home 是撤销时重放越界护栏的依据（R10）。fixture 里的 moved/index
+		// 路径都在 root 下，所以写 root 即可；不写就会被判成「旧格式」拒绝撤销，
+		// 而这几个用例要验的是 mode 判定，不是旧格式处理。
+		Home:    root,
 		Count:   1,
 		Agents:  []string{"demo"},
 		Moved:   []journalMoved{{Orig: f.bodyPath, Trashed: f.trashedPath}},

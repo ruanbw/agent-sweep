@@ -197,6 +197,10 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 		BatchID: batchID,
 		At:      now,
 		Mode:    c.opts.Mode,
+		// 记下这次删除用的数据根：撤销时 journal 里的 Orig 必须重新过一遍
+		// checkPathInHome，否则一份可被改写的 journal 就能让应用把文件搬到
+		// 任意位置（R10）。旧 journal 没有这个字段，Undo 会拒绝恢复。
+		Home:    home,
 		Moved:   []journalMoved{},
 		Indexes: []journalBackup{},
 		SQLite:  []journalDB{},

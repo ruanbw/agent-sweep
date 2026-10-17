@@ -19,9 +19,16 @@ import (
 // 三者的动作不同：备份文件要覆盖回去，废纸篓条目要挪回来，SQLite 库虽然也是
 // 覆盖，但覆盖前必须清掉 sidecar。类型分清楚，Undo 里就不需要 switch 猜。
 type journal struct {
-	BatchID string          `json:"batchId"`
-	At      time.Time       `json:"at"`
-	Mode    string          `json:"mode"`
+	BatchID string    `json:"batchId"`
+	At      time.Time `json:"at"`
+	Mode    string    `json:"mode"`
+	// Home 是这次删除时的数据根，撤销时用它重放 checkPathInHome 护栏。
+	//
+	// journal 只是磁盘上一份可被改写（或由旧版本写入）的 JSON，里面的 Orig
+	// 不能当成可信路径直接交给 movePath；没有这份数据根，撤销就无法判断
+	// 「这个 Orig 当初是否在允许范围内」。omitempty 让旧 journal 读回来是
+	// 空串，Undo 据此明确区分「旧格式」而不是把空串当成合法数据根。
+	Home    string          `json:"home,omitempty"`
 	Count   int             `json:"count"`
 	Freed   int64           `json:"freed"`
 	Agents  []string        `json:"agents"`
@@ -175,6 +182,13 @@ func (c *Cleaner) Undo(batchID string) (UndoResult, error) {
 		return out, nil
 	}
 
+	// 旧版本写的 journal 没有 home 字段，撤销时无法判断 Orig 是否还在允许的
+	// 数据根内。这里必须 fail-closed：缺字段不等于「无需校验」。放在 Undone
+	// 之后，是因为已经撤销过的批次没有任何磁盘动作，重复撤销仍应安静成功。
+	if strings.TrimSpace(j.Home) == "" {
+		return out, fmt.Errorf("clean: 批次 %s 的 journal 是旧格式（缺少 home 字段），无法校验原始路径是否在数据根内；为安全起见已拒绝撤销，请按 journal 的 moved 记录手工恢复", batchID)
+	}
+
 	// 数据库备份先于普通索引：两者都是覆盖，但数据库还要额外清 sidecar。
 	for i := len(j.SQLite) - 1; i >= 0; i-- {
 		entry := j.SQLite[i]
@@ -206,6 +220,15 @@ func (c *Cleaner) Undo(batchID string) (UndoResult, error) {
 		entry := j.Moved[i]
 		if entry.Orig == "" || entry.Trashed == "" {
 			out.Errors = append(out.Errors, "journal 里的移动记录不完整，已跳过")
+			continue
+		}
+		// 恢复前重放删除时的越界护栏，并且放在任何文件系统探测之前：删除时
+		// checkPathInHome 拦住了越界的 Paths，但 journal 本身是可以被改写的
+		// 文件（journal 目录权限、未来的导入/恢复接口）；不校验就
+		// MkdirAll + movePath，等于给越界路径开了一条「撤销即任意写」的路。
+		// 单条被拒只记 Errors，不影响其它条目的恢复。
+		if err := checkPathInHome(j.Home, entry.Orig); err != nil {
+			out.Errors = append(out.Errors, fmt.Sprintf("拒绝恢复数据根之外的路径 %s: %v", entry.Orig, err))
 			continue
 		}
 		if pathExists(entry.Orig) {
