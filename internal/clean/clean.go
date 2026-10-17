@@ -442,15 +442,15 @@ func (c *Cleaner) deleteFileSession(
 	}
 
 	if c.opts.Mode == ModeTrash {
-		return trashFileSession(s, trashRoot, trashErr, j, res, writer)
+		return trashFileSession(s, home, trashRoot, trashErr, j, res, writer)
 	}
 
-	// permanent 模式语义保持不变：没有废纸篓可回滚，逐条 RemoveAll，
-	// 失败的路径逐条记错，不影响其余路径。
+	// permanent 模式语义保持不变：没有废纸篓可回滚，逐条删除，失败的路径
+	// 逐条记错，不影响其余路径。删除走 fd 相对操作，避免校验之后被换链。
 	ok := true
 	for i, path := range s.Paths {
 		size := fsx.Size(path)
-		if err := os.RemoveAll(path); err != nil {
+		if err := fsx.RemoveAllUnder(home, path); err != nil {
 			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
 			ok = false
 			continue
@@ -469,7 +469,7 @@ func (c *Cleaner) deleteFileSession(
 // journal 写盘失败，调用方据此停止整批删除。
 func trashFileSession(
 	s session.Session,
-	trashRoot string,
+	home, trashRoot string,
 	trashErr error,
 	j *journal,
 	res *Result,
@@ -500,7 +500,7 @@ func trashFileSession(
 	// start 之前的 Moved 条目属于先前的会话；回滚只能碰本次追加的区间。
 	start := len(j.Moved)
 	for i, path := range s.Paths {
-		dest, err := moveToTrash(path, trashRoot)
+		dest, err := moveToTrash(home, path, trashRoot)
 		if err != nil {
 			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
 			// 预检没预测到的运行期失败（竞态、磁盘写满等）：尽力把本次会话
@@ -649,7 +649,7 @@ func (c *Cleaner) deleteSidecars(
 				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: trashErr.Error()})
 				continue
 			}
-			dest, err := moveToTrash(path, trashRoot)
+			dest, err := moveToTrash(home, path, trashRoot)
 			if err != nil {
 				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
 				continue
@@ -662,7 +662,7 @@ func (c *Cleaner) deleteSidecars(
 			continue
 		}
 		size := fsx.Size(path)
-		if err := os.RemoveAll(path); err != nil {
+		if err := fsx.RemoveAllUnder(home, path); err != nil {
 			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
 			continue
 		}

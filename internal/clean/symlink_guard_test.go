@@ -94,8 +94,10 @@ func TestDeleteStillRemovesRegularFileInHome(t *testing.T) {
 	}
 }
 
-// 正向：home 内部指向 home 内部的链接不算越界，不应被误伤。
-func TestDeleteAllowsSymlinkResolvingInsideHome(t *testing.T) {
+// 语义收紧：删除改用 fd 相对操作后，任何中间层符号链接都会被拒绝 —— 即使
+// 它解析后仍在 home 内。follow 链接需要重新做真实路径校验，那正是 TOCTOU 的
+// 来源；数据根内部本不该有中间层链接，所以保守拒绝、让用户手工处理。
+func TestDeleteRejectsIntermediateSymlinkEvenInsideHome(t *testing.T) {
 	f := newFixture(t, ModePermanent)
 	realDir := filepath.Join(f.home, "real-projects")
 	body := filepath.Join(realDir, "s1.jsonl")
@@ -110,19 +112,20 @@ func TestDeleteAllowsSymlinkResolvingInsideHome(t *testing.T) {
 		[]session.Session{fileSession("s1", filepath.Join(linkDir, "s1.jsonl"))},
 	)
 	if err != nil {
-		t.Fatalf("Delete: %v", err)
+		t.Fatalf("Delete 不应因单条路径被拒而返回致命错误: %v", err)
 	}
-	if len(res.Errors) != 0 {
-		t.Fatalf("unexpected errors: %+v", res.Errors)
+	if res.Count != 0 {
+		t.Fatalf("中间层链接的会话不应计入 Count，got %d", res.Count)
 	}
-	if res.Count != 1 {
-		t.Fatalf("Count = %d, want 1", res.Count)
+	if len(res.Errors) == 0 {
+		t.Fatalf("中间层链接必须记 ItemError")
 	}
-	if fsx.Exists(filepath.Join(linkDir, "s1.jsonl")) {
-		t.Fatalf("home 内的链接路径应被正常删除")
+	// 拒绝时真实文件与链接都不该被动过。
+	if !fsx.Exists(body) {
+		t.Fatalf("真实文件不应被删除: %s", body)
 	}
-	if fsx.Exists(body) {
-		t.Fatalf("真实文件应随链接路径一起被删除: %s", body)
+	if _, err := os.Lstat(linkDir); err != nil {
+		t.Fatalf("被拒绝时不应改动中间层链接: %v", err)
 	}
 }
 
