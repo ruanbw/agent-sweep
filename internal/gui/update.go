@@ -329,6 +329,15 @@ func (s *Service) installUpdate() {
 	s.mu.Unlock()
 
 	if onRestart != nil {
+		// 先把「等旧进程退出再 open 新包」的脚本挂上去，再退出自己。
+		// 顺序反了就是「应用关了但没重开」——这个 bug 只有真跑一次更新才会发现。
+		if err := update.RelaunchAfterExit(result.Path, os.Getpid(), update.DefaultWorkDir()); err != nil {
+			s.mu.Lock()
+			s.updateView.State = "error"
+			s.updateView.Error = "更新已安装，但自动重启失败：" + err.Error() + "（请手动重新打开）"
+			s.mu.Unlock()
+			return
+		}
 		// 留一拍让前端把「安装完成」画出来，再退出进程交给重启脚本。
 		time.Sleep(900 * time.Millisecond)
 		onRestart()

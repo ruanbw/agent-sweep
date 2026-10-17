@@ -356,3 +356,17 @@ func TestDetectBundleOutsideApp(t *testing.T) {
 		t.Fatalf("测试二进制不在 .app 里，应返回 ErrNotAppBundle，得到 %v", err)
 	}
 }
+
+func TestRelaunchScriptQuotesPath(t *testing.T) {
+	script := relaunchScript("/Applications/My App's AgentSweep.app", 4242)
+	if !strings.Contains(script, "kill -0 4242") {
+		t.Fatalf("脚本没有等 PID：%s", script)
+	}
+	// 单引号必须被转义成 '\''，否则路径里有引号时 /bin/sh 会解析错。
+	if !strings.Contains(script, `'/Applications/My App'\''s AgentSweep.app'`) {
+		t.Fatalf("脚本里的路径没有正确转义：%s", script)
+	}
+	if !strings.Contains(script, "open -n") {
+		t.Fatalf("脚本没有重开应用：%s", script)
+	}
+}

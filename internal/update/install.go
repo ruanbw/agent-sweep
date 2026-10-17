@@ -504,13 +504,7 @@ func RelaunchAfterExit(appPath string, pid int, workDir string) error {
 		return err
 	}
 	scriptPath := filepath.Join(workDir, "relaunch.sh")
-	script := fmt.Sprintf(`#!/bin/sh
-# AgentSweep 更新完成后重启：等旧进程退出，再打开新包。
-while kill -0 %d 2>/dev/null; do sleep 0.2; done
-xattr -dr com.apple.quarantine %s 2>/dev/null
-open -n %s
-`, pid, shellQuote(appPath), shellQuote(appPath))
-	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(relaunchScript(appPath, pid)), 0o755); err != nil {
 		return err
 	}
 	command := exec.Command("/bin/sh", scriptPath)
@@ -518,6 +512,17 @@ open -n %s
 	command.Stdout = nil
 	command.Stderr = nil
 	return command.Start()
+}
+
+// relaunchScript 单独拆出来是为了能测：路径必须正确转义，
+// 否则应用装在带空格或引号的目录下就重启不了。
+func relaunchScript(appPath string, pid int) string {
+	return fmt.Sprintf(`#!/bin/sh
+# AgentSweep 更新完成后重启：等旧进程退出，再打开新包。
+while kill -0 %d 2>/dev/null; do sleep 0.2; done
+xattr -dr com.apple.quarantine %s 2>/dev/null
+open -n %s
+`, pid, shellQuote(appPath), shellQuote(appPath))
 }
 
 // shellQuote 用单引号包住路径；路径里的单引号转成 '\”。
