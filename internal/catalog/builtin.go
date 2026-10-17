@@ -366,9 +366,18 @@ func Builtin() []Spec {
 		},
 		{
 			ID: "devin-cli", Name: "Devin CLI", Group: GroupCLI, Vendor: "Cognition",
-			Roots: []string{"~/.local/share/devin"}, Env: []string{"XDG_DATA_HOME"},
+			// Roots 不用 XDG_DATA_HOME 兜底：Spec.Home 里 Env 的语义是「变量值就是
+			// 数据根」，而 XDG_DATA_HOME 是父目录（~/.local/share）。列进 Env 之后，
+			// 用户一旦设置它，库会被解析成 <XDG_DATA_HOME>/cli/sessions.db —— 少了
+			// devin/ 一段，永远扫到 0 条，而且不报错，看起来像「没装」。其它条目的
+			// Env 都是 CLAUDE_CONFIG_DIR / CODEX_HOME 这种目录级变量，没有这个歧义。
+			Roots: []string{"~/.local/share/devin"},
 			// 一会话一行 + 5 张以 session_id 为外键的子表，正好落在 Rows 能力内。
-			// 老版本的库名是 cli_sessions.db，两个都列上（同 Home 下互斥）。
+			// 老版本的库名是 cli_sessions.db，但这里只声明当前版本的 cli/sessions.db：
+			// 缺库时 deleteSQLiteSessions 会先给该 Spec 的每条会话记一条
+			// 「库文件不存在」的 backupErr，于是整款 Agent 的删除全部失败。盲列
+			// 第二条换不来兼容，只会让升级过的机器彻底删不动 —— 老库名按「当前版本
+			// 不支持」处理，等拿到实机样本确认后再补。
 			Stores: []Store{
 				sqliteStore("cli/sessions.db", "sessions", "id", "title", "last_activity_at", "working_directory",
 					"message_nodes:session_id", "prompt_history:session_id",

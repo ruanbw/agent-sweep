@@ -1,6 +1,9 @@
 package catalog
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // 内置目录的「结构约束」测试。目录靠人手加条目，最容易犯的两类错
 // 单看代码都像对的：ID 重名（保存设置时会互相覆盖）和必填字段漏写
@@ -76,5 +79,53 @@ func TestBuiltinIDsAreStable(t *testing.T) {
 		if !have[id] {
 			t.Errorf("内置 ID %q 消失了：它可能已写进用户的设置与适配器", id)
 		}
+	}
+}
+
+// TestDevinCLIDoesNotTreatXDGDataHomeAsDataRoot 钉住 Home 的 Env 语义。
+//
+// Spec.Home 命中 Env 时直接把变量值当数据根返回，不做拼接；而 XDG_DATA_HOME
+// 是父目录（普通机器上是 ~/.local/share）。把它列进 Env，用户一旦设置该变量，
+// 数据根就变成 ~/.local/share，Store 被解析成 ~/.local/share/cli/sessions.db，
+// 少了 devin/ 一段 —— 扫描永远 0 条且不报错，用户只会以为「没装 Devin CLI」。
+// 其余条目的 Env 都是目录级变量（CLAUDE_CONFIG_DIR / CODEX_HOME …），只有这条
+// 曾经是父级，所以单独钉一条用例。
+func TestDevinCLIDoesNotTreatXDGDataHomeAsDataRoot(t *testing.T) {
+	const xdgDataHome = "/tmp/xdg-data"
+
+	specs := Builtin()
+	var spec *Spec
+	for i := range specs {
+		if specs[i].ID == "devin-cli" {
+			spec = &specs[i]
+			break
+		}
+	}
+	if spec == nil {
+		t.Fatal("内置目录里没有 devin-cli，测试需随声明更新")
+	}
+
+	for _, key := range spec.Env {
+		if key == "XDG_DATA_HOME" {
+			t.Fatalf("devin-cli 的 Env 又包含了 XDG_DATA_HOME：它是父目录，被当成数据根会丢掉 devin/ 一段")
+		}
+	}
+
+	// 注入一个「用户设置了 XDG_DATA_HOME」的环境，看 Home 会不会被带偏。
+	got := spec.Home(func(k string) string {
+		if k == "XDG_DATA_HOME" {
+			return xdgDataHome
+		}
+		return ""
+	})
+	for _, forbidden := range []string{xdgDataHome, filepath.Join(xdgDataHome, "cli")} {
+		if got == forbidden {
+			t.Fatalf("Home 把 XDG_DATA_HOME 当成了数据根：got %q", got)
+		}
+	}
+	// 只允许两种结果：本机没装（空串），或 Roots 里 ~/.local/share/devin 的
+	// 展开值。不硬断具体路径，因为后者取决于本机是否真的有这个目录。
+	if wantRoot := expand("~/.local/share/devin"); got != "" && got != wantRoot {
+		t.Fatalf("Home = %q，只允许空串或 Roots 展开值 %q", got, wantRoot)
 	}
 }
