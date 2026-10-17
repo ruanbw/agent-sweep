@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -166,9 +167,42 @@ func ReadMetaZstd(path string) Meta {
 
 // ReadMetaDir 在一个「目录即会话」的目录里找可读元数据：
 // 先认常见的明文文件名，再认 zstd 压缩的 JSONL。都找不到就返回空 Meta。
+//
+// 这一层没有时再下探一层子目录：有些 Agent 把正文放在 <会话目录>/run-0/ 下
+// （Pi 的重跑布局就是这样，run-0 是第一次跑，run-1 是重试）。只下探一层，
+// 且按名字排序取第一个 —— 深递归会在会话目录很大时变成新的耗时点。
 func ReadMetaDir(dir string) Meta {
+	if meta := readMetaDirNames(dir); meta.Title != "" || meta.Project != "" {
+		return meta
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return Meta{}
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		// 隐藏项不进；只认目录，因为要下探的是 run-N 这种子目录。
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if meta := readMetaDirNames(filepath.Join(dir, name)); meta.Title != "" || meta.Project != "" {
+			return meta
+		}
+	}
+	return Meta{}
+}
+
+// readMetaDirNames 只在 dir 这一层按名字找元数据，不再下探。
+func readMetaDirNames(dir string) Meta {
 	names := []string{
 		"api_conversation_history.json", "conversation.json", "session.json",
+		// 明文 JSONL：Pi 的正文就是 session.jsonl（放在 run-N/ 下）。
+		// 以前只有 .json 与两个 .zstd 变体，导致这类会话标题一律退化成 uuid。
+		"session.jsonl",
 		"meta.json", "messages.json", "session.v4.jsonl.zstd", "session.jsonl.zstd",
 	}
 	for _, name := range names {
@@ -296,7 +330,7 @@ func (m *Meta) merge(obj map[string]any) {
 		}
 	}
 	if m.Title == "" && !nonUserRoles[role] {
-		if text := contentText(contentOf(obj), b); text != "" {
+		if text := contentText(contentOf(obj), b); text != "" && !isBoilerplate(text) {
 			m.Title = clean(text)
 		}
 	}
@@ -365,7 +399,7 @@ func (m *Meta) merge(obj map[string]any) {
 	}
 
 	if m.Snippet == "" && !nonUserRoles[role] {
-		if text := contentText(contentOf(obj), b); text != "" {
+		if text := contentText(contentOf(obj), b); text != "" && !isBoilerplate(text) {
 			m.Snippet = clean(text)
 		}
 	}
@@ -422,7 +456,9 @@ func deepUserText(value any, depth int, b *budget) string {
 	case map[string]any:
 		if role, _ := v["role"].(string); role == "user" {
 			for _, key := range []string{"content", "parts", "text", "message"} {
-				if text := contentText(v[key], b); text != "" {
+				// 环境说明（<system-reminder> 等）也是 role=user，但不该当标题；
+				// 跳过它继续往下找，找不到就退回文件名。
+				if text := contentText(v[key], b); text != "" && !isBoilerplate(text) {
 					return text
 				}
 			}
@@ -599,6 +635,38 @@ func looseString(s, key string) (string, bool) {
 }
 
 // clean 压掉换行与多余空白，标题在列表里是单行渲染的。
+// boilerplatePrefixes 是「不是用户说的话」的正文前缀。
+//
+// 有些 Agent 会往用户消息里塞一大段环境说明：WorkBuddy/CodeBuddy 是
+// <system-reminder data-role="user-context"> 包住的 OS/Shell/Workspace 信息，
+// 其他家也有 <user_info>、<env> 这类包装。它们 role=user、也确实是正文的一部分，
+// 但拿来当标题毫无信息量（而且会占满 80 字，把真正的第一句挤掉）。
+var boilerplatePrefixes = []string{
+	"<system-reminder",
+	"<user_info",
+	"<environment",
+	"<env",
+	"<context",
+	"# AGENTS.md",
+	"Users/",
+}
+
+// isBoilerplate 判断一段用户正文是不是「环境说明」而不是真实发言。
+// 只看前缀，且要求正文以这些标记开头 —— 用户自己写的 `<` 开头内容很少见，
+// 即使误判，代价也只是退回到下一条消息，不会丢会话。
+func isBoilerplate(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return true
+	}
+	for _, prefix := range boilerplatePrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func clean(s string) string {
 	s = strings.ReplaceAll(s, "\r", " ")
 	s = strings.ReplaceAll(s, "\n", " ")

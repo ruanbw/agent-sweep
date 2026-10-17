@@ -189,3 +189,37 @@ func TestReadMetaParsesTempJSONL(t *testing.T) {
 		t.Fatalf("时间解析错误：%v", meta.Time)
 	}
 }
+
+// 目录即会话时，正文可能不在目录这一层，而在唯一的 run-N/ 子目录里
+// （Pi 的重跑布局）。ReadMetaDir 必须下探一层，否则标题退化成 uuid。
+func TestReadMetaDirDescendsIntoRunDir(t *testing.T) {
+	dir := t.TempDir()
+	sessionDir := filepath.Join(dir, "a87c216c-6890-4ecc-bf58-2b02e1a46b79", "run-0")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	body := `{"type":"session","version":3,"id":"x","cwd":"/Users/me/proj","timestamp":"2026-10-17T10:03:05.401Z"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"帮我盘点项目目录"}]}}
+`
+	if err := os.WriteFile(filepath.Join(sessionDir, "session.jsonl"), []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	meta := ReadMetaDir(filepath.Join(dir, "a87c216c-6890-4ecc-bf58-2b02e1a46b79"))
+	if meta.Title != "帮我盘点项目目录" {
+		t.Errorf("Title = %q，期望从 run-0/session.jsonl 抽到用户第一条消息", meta.Title)
+	}
+}
+
+// WorkBuddy / CodeBuddy 会把一段环境说明（OS / Shell / Workspace）塞进
+// role=user 的第一条消息。它确实是正文，但当标题毫无信息量，而且会占满
+// 80 字的标题预算，把用户真正的第一句话挤掉。
+func TestBoilerplateReminderIsNotUsedAsTitle(t *testing.T) {
+	head := []byte(`{"type":"message","role":"user","content":[{"type":"input_text","text":"<system-reminder data-role=\"user-context\">\n<user_info>\nOS Version: darwin\nShell: /bin/zsh\n</user_info>\n</system-reminder>"}]}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"帮我做一张打卡手账"}]}
+`)
+	meta := ParseJSONL(head)
+	if meta.Title != "帮我做一张打卡手账" {
+		t.Errorf("Title = %q，期望跳过 <system-reminder> 取真正的第一条用户发言", meta.Title)
+	}
+}
