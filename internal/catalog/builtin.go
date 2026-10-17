@@ -501,10 +501,9 @@ func Builtin() []Spec {
 				// workspace_chats 是「一轮问答」一行，不是线程级的会话。按行删能
 				// 精确清掉某一轮，但同一线程在列表里会出现多行 —— 这是它的数据
 				// 模型决定的，写进 Note 而不是假装它是一条会话。
-				sqliteStore("storage/anythingllm.db", "workspace_chats", "id", "prompt", "createdAt", "",
-					"workspace_threads:thread_id"),
+				sqliteStore("storage/anythingllm.db", "workspace_chats", "id", "prompt", "createdAt", ""),
 			},
-			Note: "按「一轮问答」一行计，同一线程会有多行；删行不做 VACUUM，空间靠后续整理回收。",
+			Note: "按「一轮问答」一行计，同一线程会有多行；删行后会 VACUUM，空间当场回收。",
 		},
 		{
 			ID: "lm-studio", Name: "LM Studio", Group: GroupApp, Vendor: "Element Labs",
