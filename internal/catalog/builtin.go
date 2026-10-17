@@ -97,8 +97,17 @@ func Builtin() []Spec {
 			ID: "pi", Name: "Pi Agent", Group: GroupCLI, Vendor: "Pi",
 			Bundles: []string{"Pi Agent.app", "Pi.app"},
 			Roots:   []string{"~/.pi/agent", "~/.pi"}, Env: []string{"PI_HOME"},
-			Stores: []Store{jsonlStore("sessions/*/*.jsonl")},
-			Note:   "sessions/<项目>/<时间戳>_<id>.jsonl。",
+			Stores: []Store{
+				// v0.99 起的真实布局：sessions/<项目>/<时间戳>_<id>/<agent-id>/run-N/session.jsonl。
+				// 一条会话是那个 <agent-id> 目录（run-N 是它的重跑），所以按 dir 收，
+				// 体积也算到整个目录头上。早先声明的 `sessions/*/*.jsonl` 在新布局下
+				// 一条都匹配不到 —— 保留它是为了兼容还没升级的老版本落盘。
+				// 第三层限定成 uuid：同一层还并排放着 `subagent-artifacts/`（子代理的
+				// 输入输出留档），它不是一个会话，用 `*` 会把它当成一条会话收进来。
+				dirStore("sessions/*/*/[0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*-[0-9a-f]*"),
+				jsonlStore("sessions/*/*.jsonl"),
+			},
+			Note: "sessions/<项目>/<时间戳>_<id>/<agent>/run-N/session.jsonl；一个 <agent> 目录即一条会话。",
 		},
 		{
 			ID: "dsh", Name: "DeepSeek Harness", Group: GroupCLI, Vendor: "DeepSeek",
@@ -231,14 +240,29 @@ func Builtin() []Spec {
 			ID: "codebuddy", Name: "CodeBuddy", Group: GroupIDE, Vendor: "Tencent",
 			Bundles: []string{"CodeBuddy.app"},
 			Roots:   []string{"~/Library/Application Support/CodeBuddy", "~/.codebuddy"},
-			Stores:  []Store{jsonStore("User/workspaceStorage/*/chatSessions/*.json")},
+			Stores: []Store{
+				jsonStore("User/workspaceStorage/*/chatSessions/*.json"),
+				// CodeBuddy Code（CLI）与 Claude Code 同构：projects/<mangled-cwd>/<id>.jsonl，
+				// 子代理在同一层的 <id>/subagents/agent-*.jsonl。IDE 版是 VS Code fork
+				// 的 chatSessions，两者互不影响，所以两条 Store 都要留着。
+				jsonlStore("projects/*/*.jsonl"),
+			},
+			Note: "IDE 版在 workspaceStorage/chatSessions，CLI 版在 projects/ 下（Claude Code 同构）。",
 		},
 		{
 			ID: "workbuddy", Name: "WorkBuddy", Group: GroupApp, Vendor: "Tencent",
 			Bundles: []string{"WorkBuddy.app", "WorkBuddy AI.app"},
 			Roots:   []string{"~/.workbuddy", "~/.workbuddy-ai"},
-			Stores:  []Store{dirStore("conversations/*"), jsonStore("sessions/*.json")},
-			Note:    "目录结构随版本变化，未命中时会出现在「发现」页。",
+			Stores: []Store{
+				// 真实布局（5.8.x 实测）：projects/<mangled-cwd>/<session-id>.jsonl，
+				// 同名的 <session-id>/ 目录里是 tool-results 等旁挂产物，
+				// <session-id>.file-rollback.ndjson 是文件回滚日志 —— 三者同删。
+				// 早先声明的 conversations/* 与 sessions/*.json 在这些版本里都不存在。
+				jsonlStore("projects/*/*.jsonl", "{id}", "{id}.file-rollback.ndjson"),
+				// 会话索引：标题、状态、创建/更新时间都在这张表里。
+				sqliteStore("workbuddy.db", "sessions", "id", "title", "updated_at", "cwd"),
+			},
+			Note: "正文是 projects/<项目>/<会话>.jsonl；workbuddy.db 里另有一份会话索引，删除会一并裁掉。",
 		},
 		{
 			// 同一款 IDE 的稳定版 / 预览版 / 国内版数据目录是并列的，
@@ -303,6 +327,226 @@ func Builtin() []Spec {
 			ID: "iflow", Name: "iFlow CLI", Group: GroupCLI, Vendor: "iFlow",
 			Roots:  []string{"~/.iflow"},
 			Stores: []Store{jsonStore("tmp/*/chats/*.json"), jsonlStore("sessions/*.jsonl")},
+		},
+
+		// —— 2026-10 补充收录（CLI / 桌面客户端）——
+		//
+		// 这批的共同点：会话形态都落在现有四种 Store 内，不需要动扫描引擎。
+		// 路径来自各项目的上游源码与独立实现的会话格式注册表（deja-vu 会话格式
+		// registry、jazzyalex/agent-sessions），不是凭印象写的；本机没装的条目
+		// 无法实测，但写错只会显示「未安装」，不会误删。
+		//
+		// 一条铁律：**CLI 与它的 IDE 版是两套数据根**。Spec.Home 只取第一个存在
+		// 的根，把两者塞进同一条会让用户没法只清其中一个 —— 所以数据根不同的
+		// 一律拆开，跟 trae / trae-cn 的处理一致。
+		{
+			ID: "trae-cli", Name: "TRAE CLI", Group: GroupCLI, Vendor: "ByteDance",
+			Roots: []string{"~/.trae"}, Env: []string{"TRAE_HOME"},
+			Stores: []Store{
+				// rollout-*.jsonl 与 Codex 的 rollout 同构，标题解析可直接复用。
+				// 后缀 .jsonl.zst 的变体暂不支持：引擎还没有通用的解压路径。
+				jsonlStore("cli/sessions/**/rollout-*.jsonl"),
+				jsonlStore("cli/archived_sessions/**/rollout-*.jsonl"),
+			},
+			Indexs: []Index{jsonlIndex("cli/history.jsonl", "session_id")},
+			Note:   "与 Trae IDE 是两套数据；cli/ 下是 Codex rollout 同构的 JSONL。",
+		},
+		{
+			ID: "grok", Name: "Grok Build", Group: GroupCLI, Vendor: "xAI",
+			Roots: []string{"~/.grok"}, Env: []string{"GROK_HOME"},
+			// sessions/<workspace>/<id>/ 里是 summary.json（标题）+ updates.jsonl
+			// （ACP 事件流）。按目录收，一条会话 = 一个目录，两个文件一起走。
+			Stores: []Store{dirStore("sessions/*/*")},
+			Note:   "标题在 summary.json；正文是 ACP 事件流 updates.jsonl。",
+		},
+		{
+			ID: "devin-cli", Name: "Devin CLI", Group: GroupCLI, Vendor: "Cognition",
+			Roots: []string{"~/.local/share/devin"}, Env: []string{"XDG_DATA_HOME"},
+			// 一会话一行 + 5 张以 session_id 为外键的子表，正好落在 Rows 能力内。
+			// 老版本的库名是 cli_sessions.db，两个都列上（同 Home 下互斥）。
+			Stores: []Store{
+				sqliteStore("cli/sessions.db", "sessions", "id", "title", "last_activity_at", "working_directory",
+					"message_nodes:session_id", "prompt_history:session_id",
+					"rendered_commits:session_id", "tool_call_state:session_id",
+					"subagent_heads:session_id"),
+			},
+			Note: "删行 + 备份整库；子代理的消息在 subagent_heads 里另记，已一并带上。",
+		},
+		{
+			ID: "junie", Name: "Junie", Group: GroupCLI, Vendor: "JetBrains",
+			Roots: []string{"~/.junie"}, Env: []string{"JUNIE_HOME"},
+			Stores: []Store{dirStore("sessions/*")},
+			Indexs: []Index{jsonlIndex("sessions/index.jsonl", "id")},
+			Note:   "一个会话一个目录，正文是 events.jsonl；sessions/index.jsonl 是索引。",
+		},
+		{
+			ID: "mistral-vibe", Name: "Mistral Vibe", Group: GroupCLI, Vendor: "Mistral",
+			Roots: []string{"~/.vibe"}, Env: []string{"VIBE_HOME"},
+			Stores: []Store{dirStore("logs/session/*")},
+			Note:   "logs/session/<id>/ 是一份 transcript。",
+		},
+		{
+			// 与 pi 同构（扁平根），解析完全共享。
+			ID: "kimchi", Name: "Kimchi Coding", Group: GroupCLI, Vendor: "Castle",
+			Roots:  []string{"~/.config/kimchi"},
+			Stores: []Store{jsonlStore("harness/sessions/*/*.jsonl")},
+		},
+		{
+			ID: "commandcode", Name: "Command Code", Group: GroupCLI, Vendor: "Command Code",
+			Roots:  []string{"~/.commandcode"},
+			Stores: []Store{jsonlStore("projects/*/*.jsonl")},
+		},
+		{
+			ID: "muse-code", Name: "Muse Code", Group: GroupCLI, Vendor: "Muse",
+			Roots:  []string{"~/.local/share/muse"},
+			Stores: []Store{jsonlStore("sessions/**/*/session.jsonl")},
+		},
+		{
+			ID: "zcode", Name: "ZCode", Group: GroupCLI, Vendor: "ZCode",
+			Roots:  []string{"~/.zcode"},
+			Stores: []Store{jsonlStore("projects/*/*.jsonl")},
+			// cli/db/db.sqlite 是同一批会话的另一份索引，格式与 opencode 同族，
+			// 但表名没核实 —— 猜表名比不裁索引更危险，故先不写进 Indexs。
+			Note: "cli/db/db.sqlite 另有一份索引，当前版本不裁，删完可能留下条目。",
+		},
+		{
+			ID: "reasonix", Name: "Reasonix", Group: GroupCLI, Vendor: "Reasonix",
+			Roots: []string{"~/.reasonix"}, Env: []string{"REASONIX_STATE_HOME"},
+			Stores: []Store{
+				jsonlStore("sessions/*.jsonl"),
+				jsonlStore("projects/*/sessions/*.jsonl"),
+			},
+			Note: "1.x 的 sessions-v4/*/events.frames 是 zstd 帧，当前扫不到。",
+		},
+		{
+			ID: "codewhale", Name: "CodeWhale", Group: GroupCLI, Vendor: "CodeWhale",
+			Roots: []string{"~/.codewhale", "~/.deepseek"}, Env: []string{"CODEWHALE_HOME"},
+			Stores: []Store{jsonStore("sessions/*.json")},
+		},
+		{
+			ID: "openclaw", Name: "OpenClaw", Group: GroupCLI, Vendor: "OpenClaw",
+			Roots: []string{"~/.openclaw"}, Env: []string{"OPENCLAW_STATE_DIR"},
+			Stores: []Store{jsonlStore("agents/*/sessions/*.jsonl")},
+			Note:   "agents/<agent>/sessions/ 下是 append-only 的 pi 格式 JSONL。",
+		},
+		{
+			ID: "billion-context", Name: "Billion Context", Group: GroupCLI, Vendor: "Billion Context",
+			Roots:  []string{"~/.local/share/billion-context"},
+			Stores: []Store{jsonStore("sessions/*/*.json")},
+			Note:   "按上游协议分目录（sessions/openai/…），标题在 payload.meta.title。",
+		},
+		{
+			// pi 的会话格式被若干衍生 harness 复用，解析共享，各加一条即可。
+			ID: "omp", Name: "Oh My Pi", Group: GroupCLI, Vendor: "omp",
+			Roots:  []string{"~/.omp/agent"},
+			Stores: []Store{jsonlStore("sessions/**/*.jsonl")},
+		},
+		{
+			ID: "prime-agent", Name: "Prime Agent", Group: GroupCLI, Vendor: "PrimeIntellect",
+			Roots:  []string{"~/.prime/agent"},
+			Stores: []Store{jsonlStore("sessions/**/*.jsonl")},
+		},
+		{
+			ID: "senpi", Name: "Senpi", Group: GroupCLI, Vendor: "Senpi",
+			Roots:  []string{"~/.senpi/agent"},
+			Stores: []Store{jsonlStore("sessions/*/*.jsonl")},
+		},
+		{
+			ID: "gajae-code", Name: "Gajae Code", Group: GroupCLI, Vendor: "gjc",
+			Roots:  []string{"~/.gjc/agent"},
+			Stores: []Store{jsonlStore("sessions/*/*.jsonl")},
+		},
+
+		// —— 同名产品的 CLI 形态：数据根与 IDE 版不同，只能单独一条 ——
+		{
+			ID: "cursor-agent-cli", Name: "Cursor Agent CLI", Group: GroupCLI, Vendor: "Anysphere",
+			Roots: []string{"~/.cursor"}, Env: []string{"CURSOR_CONFIG_DIR"},
+			Stores: []Store{
+				jsonlStore("projects/**/agent-transcripts/**/*.jsonl"),
+			},
+			// chats/*/*/store.db 也是会话库，但一个会话一个库（DB 目前不支持 glob）。
+			Note: "与 Cursor IDE 是两套数据；chats/*/*/store.db 暂时扫不到，只能清 transcript。",
+		},
+		{
+			ID: "cline-cli", Name: "Cline CLI", Group: GroupCLI, Vendor: "Cline",
+			Roots: []string{"~/.cline"},
+			Env:   []string{"CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR"},
+			Stores: []Store{
+				jsonStore("data/sessions/*/*.messages.json"),
+				jsonStore("sessions/*/*.messages.json"),
+			},
+		},
+		{
+			ID: "kiro-cli", Name: "Kiro CLI", Group: GroupCLI, Vendor: "AWS",
+			Roots: []string{
+				"~/Library/Application Support/kiro-cli",
+				"~/.local/share/kiro-cli",
+				"~/.kiro",
+			},
+			Stores: []Store{
+				jsonlStore("sessions/cli/*.jsonl"),
+				jsonlStore("sessions/*/sess_*/messages.jsonl"),
+			},
+		},
+
+		// —— 本地优先的桌面 AI 客户端 ——
+		{
+			ID: "anythingllm", Name: "AnythingLLM", Group: GroupApp, Vendor: "Mintplex Labs",
+			Bundles: []string{"AnythingLLM.app"},
+			Roots: []string{
+				"~/Library/Application Support/anythingllm-desktop",
+				"~/.config/anythingllm-desktop",
+			},
+			Stores: []Store{
+				// workspace_chats 是「一轮问答」一行，不是线程级的会话。按行删能
+				// 精确清掉某一轮，但同一线程在列表里会出现多行 —— 这是它的数据
+				// 模型决定的，写进 Note 而不是假装它是一条会话。
+				sqliteStore("storage/anythingllm.db", "workspace_chats", "id", "prompt", "createdAt", "",
+					"workspace_threads:thread_id"),
+			},
+			Note: "按「一轮问答」一行计，同一线程会有多行；删行不做 VACUUM，空间靠后续整理回收。",
+		},
+		{
+			ID: "lm-studio", Name: "LM Studio", Group: GroupApp, Vendor: "Element Labs",
+			Bundles: []string{"LM Studio.app"},
+			Roots:   []string{"~/.lmstudio", "~/.cache/lm-studio"},
+			Stores:  []Store{jsonStore("conversations/*.json")},
+			Note:    "官方明确不保证会话 JSON 结构稳定，所以只靠启发式抽标题。",
+		},
+		{
+			// VS Code 的 Copilot Agent 会为每个「会话工作区」建一个 <uuid>/session.db。
+			// 库里是 turns / local_turns / file_edits / chat_drafts / reviewed_files，
+			// 外加 session_metadata 里的 git / github 信息。一个目录 = 一条会话。
+			// 注意：本机 108 个库里 turns 全为 0（只有元数据），所以体积很小、
+			// 标题会退化成 uuid —— 这是真实情况，不是扫描出错，别当成漏扫去修。
+			ID: "copilot-agent-workspace", Name: "Copilot Agent Workspace", Group: GroupIDE, Vendor: "GitHub",
+			Bundles: []string{"Visual Studio Code.app", "Visual Studio Code - Insiders.app"},
+			Roots: []string{
+				"~/Library/Application Support/Code/agentSessionData",
+				"~/Library/Application Support/Code - Insiders/agentSessionData",
+			},
+			Stores: []Store{dirStore("*")},
+			Note:   "一个 uuid 目录一条会话，正文在目录内的 session.db；多数会话只有元数据、没有 turns。",
+		},
+		{
+			ID: "open-design", Name: "Open Design", Group: GroupApp, Vendor: "Open Design",
+			Bundles: []string{"Open Design.app"},
+			Roots: []string{
+				"~/Library/Application Support/Open Design/namespaces/release-stable-intel/data",
+				"~/Library/Application Support/Open Design/namespaces/release-stable-canary/data",
+			},
+			Stores: []Store{
+				// 正文在 app.sqlite 的 conversations 表；聊天产物（chat-artifact-blobs）
+				// 与项目文件在同级目录，删行不影响它们，因此不登记 Assoc。
+				sqliteStore("app.sqlite", "conversations", "id", "title", "updated_at", ""),
+			},
+			Note: "会话行在 app.sqlite；产物文件在 chat-artifact-blobs/ 与 projects/，删行不会带走它们。",
+		},
+		{
+			ID: "jan", Name: "Jan", Group: GroupApp, Vendor: "Jan HQ",
+			Bundles: []string{"Jan.app"},
+			Roots:   []string{"~/Library/Application Support/Jan", "~/.config/Jan"},
+			Stores:  []Store{jsonStore("data/threads/*.json")},
 		},
 	}
 }

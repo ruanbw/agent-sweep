@@ -1,6 +1,6 @@
 # AgentSweep
 
-扫描本机 AI Agent 的会话记录，勾选后清理。**默认进废纸篓，可撤销。** 内置 37 款 Agent，其余的靠指纹发现。
+扫描本机 AI Agent 的会话记录，勾选后清理。**默认进废纸篓，可撤销。** 内置 62 款 Agent，其余的靠指纹发现。
 
 <img src="docs/screenshot.png" alt="AgentSweep 主界面：左侧 Agent 列表、中间会话表格、右侧会话详情" width="1100">
 
