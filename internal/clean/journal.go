@@ -197,36 +197,14 @@ func (c *Cleaner) Undo(batchID string) (UndoResult, error) {
 		return out, fmt.Errorf("clean: 批次 %s 的 journal 是旧格式（缺少 home 字段），无法校验原始路径是否在数据根内；为安全起见已拒绝撤销，请按 journal 的 moved 记录手工恢复", batchID)
 	}
 
-	// 数据库备份先于普通索引：两者都是覆盖，但数据库还要额外清 sidecar。
-	for i := len(j.SQLite) - 1; i >= 0; i-- {
-		entry := j.SQLite[i]
-		if entry.Backup == "" {
-			continue
-		}
-		if err := removeSQLiteSidecars(entry.DB); err != nil {
-			out.Errors = append(out.Errors, fmt.Sprintf("清理数据库 sidecar 失败，已跳过恢复 %s: %v", entry.DB, err))
-			continue
-		}
-		if err := copyFileAtomic(entry.Backup, entry.DB); err != nil {
-			out.Errors = append(out.Errors, fmt.Sprintf("恢复数据库 %s 失败: %v", entry.DB, err))
-			continue
-		}
-		out.Restored++
-	}
-	for i := len(j.Indexes) - 1; i >= 0; i-- {
-		entry := j.Indexes[i]
-		if entry.Backup == "" {
-			continue
-		}
-		if err := copyFileAtomic(entry.Backup, entry.Orig); err != nil {
-			out.Errors = append(out.Errors, fmt.Sprintf("恢复索引 %s 失败: %v", entry.Orig, err))
-			continue
-		}
-		out.Restored++
-	}
-
-	// 废纸篓条目逆序挪回。逆序是为了让「先删正文、后删旁挂目录」的批次
-	// 按相反顺序复原，和文件系统里最后状态对得上。
+	// 正文（废纸篓条目）必须先于索引/数据库恢复：整库备份与索引文件都是一次
+	// 整批覆盖，一旦把索引指回去而正文没回来，用户看到的就是「点进去是空的」
+	// 幽灵会话 —— 正是删除流程反复想避免的中间态。所以先搬正文，全部成功之后
+	// 才允许还原索引/DB。
+	//
+	// 逆序挪回是为了让「先删正文、后删旁挂目录」的批次按相反顺序复原，和文件
+	// 系统里最后状态对得上。
+	movedErrorsStart := len(out.Errors)
 	for i := len(j.Moved) - 1; i >= 0; i-- {
 		entry := j.Moved[i]
 		if entry.Orig == "" || entry.Trashed == "" {
@@ -271,6 +249,49 @@ func (c *Cleaner) Undo(batchID string) (UndoResult, error) {
 			continue
 		}
 		out.Restored++
+	}
+	// 只统计本次 Moved 阶段新增的错误：进入本阶段前的历史错误（或后面阶段的
+	// 错误）不该参与「正文是否全部回来」的判断。
+	bodyFailed := len(out.Errors) > movedErrorsStart
+	// 只有「本来有索引/数据库要还原」时才补这条说明：纯文件批次跳过的是空
+	// 阶段，再说「已跳过索引还原」是在描述一件不存在的事，也会给一次普通的
+	// 副本丢失凭空多报一条错误。
+	if bodyFailed && (len(j.SQLite) > 0 || len(j.Indexes) > 0) {
+		out.Errors = append(out.Errors,
+			"正文未全部恢复，已跳过索引与数据库还原，避免还原出指向不存在正文的空会话；修好后可重试撤销")
+	}
+
+	// 只有全部正文都回来了才还原索引/数据库：整库备份是整批的，恢复它会把
+	// 失败那条会话的行也一起带回来，指向的仍是一个不存在的正文。
+	//
+	// 数据库先于普通索引：两者都是覆盖，但数据库还要额外清 sidecar。
+	if !bodyFailed {
+		for i := len(j.SQLite) - 1; i >= 0; i-- {
+			entry := j.SQLite[i]
+			if entry.Backup == "" {
+				continue
+			}
+			if err := removeSQLiteSidecars(entry.DB); err != nil {
+				out.Errors = append(out.Errors, fmt.Sprintf("清理数据库 sidecar 失败，已跳过恢复 %s: %v", entry.DB, err))
+				continue
+			}
+			if err := copyFileAtomic(entry.Backup, entry.DB); err != nil {
+				out.Errors = append(out.Errors, fmt.Sprintf("恢复数据库 %s 失败: %v", entry.DB, err))
+				continue
+			}
+			out.Restored++
+		}
+		for i := len(j.Indexes) - 1; i >= 0; i-- {
+			entry := j.Indexes[i]
+			if entry.Backup == "" {
+				continue
+			}
+			if err := copyFileAtomic(entry.Backup, entry.Orig); err != nil {
+				out.Errors = append(out.Errors, fmt.Sprintf("恢复索引 %s 失败: %v", entry.Orig, err))
+				continue
+			}
+			out.Restored++
+		}
 	}
 
 	// 只有整批成功才标记 undone。部分失败时保持 false：
