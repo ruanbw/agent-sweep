@@ -62,8 +62,23 @@ func ReadMeta(path string, jsonl bool) Meta {
 		last  = 1024 * 1024
 	)
 	var meta Meta
+	file, err := os.Open(path)
+	if err != nil {
+		return meta
+	}
+	defer file.Close()
+
+	// 缓冲区跨轮复用：扩容只增长，不再为已经读过的内容重新分配。
+	// 每轮仍从头读 —— 上一轮读到的只是前缀，重新读一遍比记账简单。
+	var buf []byte
 	for limit := int64(first); limit <= last; limit *= 4 {
-		head, err := readHead(path, limit)
+		if int64(cap(buf)) < limit {
+			buf = make([]byte, limit)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return meta
+		}
+		head, err := readHeadInto(file, buf[:limit])
 		if err != nil {
 			return meta
 		}
@@ -72,7 +87,8 @@ func ReadMeta(path string, jsonl bool) Meta {
 		} else {
 			meta = ParseJSONObject(head)
 		}
-		// 文件比 limit 短说明已经读完了，再读也没用。
+		// readHeadInto 保证：err == nil 且 len(head) < limit 只可能是真的读完了。
+		// 短读已经被它内部读满，不会走到这里被误判成 EOF。
 		if meta.Title != "" || int64(len(head)) < limit {
 			return meta
 		}
@@ -130,12 +146,52 @@ func readHead(path string, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	buf := make([]byte, limit)
-	n, err := file.Read(buf)
-	if err != nil && n == 0 {
-		return nil, err
+	return readHeadFrom(file, limit)
+}
+
+// readHeadFrom 从 r 读前 limit 字节，抽出 io.Reader 是为了让测试能注入
+// 短读 reader；readHead 只是「打开文件」的薄包装。
+func readHeadFrom(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		return nil, nil
 	}
-	return buf[:n], nil
+	return readHeadInto(r, make([]byte, limit))
+}
+
+// readHeadInto 读满 buf，或者读到真正的 io.EOF 为止。
+//
+// 这里必须用 io.ReadFull，不能只调一次 Read：Read 允许短读（管道、网络卷、
+// 加密卷、某些 FUSE 都会一次只给一部分字节），短读并不代表文件结束。
+// 单次 Read 返回 n < len(buf) 时旧代码把它当成 EOF，直接放弃标题，用户
+// 看到的就是「未命名会话」。io.ReadFull 会在内部把短读循环补满，只有底层
+// 真的给出 io.EOF 时才提前返回（n > 0 时转成 io.ErrUnexpectedEOF）。
+//
+// 因此返回值对调用方的保证是：
+//   - err == nil 且 len(out) == len(buf)：读满；
+//   - err == nil 且 len(out) < len(buf)：文件确实读完了，短读已被消化；
+//   - err != nil：真的 I/O 错误（空文件、短文件都不会走到这里）。
+//
+// 把 buf 作为参数而不是内部 make，是为了让 ReadMeta 扩容时复用同一块缓冲。
+func readHeadInto(r io.Reader, buf []byte) ([]byte, error) {
+	if len(buf) == 0 {
+		return nil, nil
+	}
+	n, err := io.ReadFull(r, buf)
+	switch err {
+	case nil, io.ErrUnexpectedEOF:
+		// 读满；或文件比 buf 短，UnexpectedEOF 在这里就是正常读完。
+		return buf[:n], nil
+	case io.EOF:
+		// 一个字节都没有：空文件不是错误（调用方按 0 字节处理）。
+		return buf[:0], nil
+	default:
+		// 真实 I/O 错误。已经读到的字节仍然可用（保持旧行为），
+		// 只有一个字节都没读到时才算失败。
+		if n == 0 {
+			return nil, err
+		}
+		return buf[:n], nil
+	}
 }
 
 // ParseJSONL 从 JSONL 头部抽元数据。
