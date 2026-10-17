@@ -29,6 +29,26 @@ type journal struct {
 	Moved   []journalMoved  `json:"moved"`
 	Indexes []journalBackup `json:"indexes"`
 	SQLite  []journalDB     `json:"sqlite"`
+
+	// persist 是 Delete 在删除过程中挂上的落盘回调；nil 表示这是一份只读账本
+	// （readJournal 读回来的、Undo 手里的、测试里手写的）。
+	//
+	// 放在这里而不是作为参数逐层传递，是因为 deleteSidecars 由 sqlite.go 调用，
+	// 签名不能改；它只有 journal 可以拿到落盘能力。unexported 字段 encoding/json
+	// 会直接忽略，不会改变 journal 的磁盘格式。
+	persist func() error
+
+	// persistErr 记录删除过程中第一次「journal 写不进去」。deleteSidecars 无法
+	// 返回 error，只能记在这里，由 Delete 在阶段结束后统一检查并停手。
+	persistErr error
+}
+
+// save 在挂有落盘回调时原子重写 journal；从磁盘读回来的账本没有回调，是 no-op。
+func (j *journal) save() error {
+	if j.persist == nil {
+		return nil
+	}
+	return j.persist()
 }
 
 type journalMoved struct {

@@ -105,12 +105,79 @@ func New(opts Options) *Cleaner {
 	return &Cleaner{opts: opts}
 }
 
+// journalWriter 负责在删除过程中逐步把 journal 原子写到磁盘。
+//
+// 这里刻意不做「最后写一次」：进程可能在删完正文、改完索引、VACUUM 完数据库之后
+// 被 kill，而扁平化的备份文件名反推不出原路径。所以每个破坏性动作一完成就整份
+// 重写 journal；几十条会话的 O(n²) 序列化换来的，是任意时刻磁盘上都有一份能撤销、
+// 能审计的账本。
+type journalWriter struct {
+	c      *Cleaner
+	j      *journal
+	res    *Result
+	agents map[string]bool
+
+	// 最后一次成功落盘的条目数，只用于把写盘失败的错误说清楚。
+	onDisk journalSnapshot
+}
+
+type journalSnapshot struct {
+	moved, sqlite, indexes int
+}
+
+func newJournalWriter(c *Cleaner, j *journal, res *Result, agents map[string]bool) *journalWriter {
+	w := &journalWriter{c: c, j: j, res: res, agents: agents}
+	// deleteSidecars 由 sqlite.go 调用，签名不能改；它只能通过 journal 上的
+	// 回调拿到落盘能力。
+	j.persist = w.save
+	return w
+}
+
+// save 刷新派生字段后原子重写 journal。
+//
+// Count / Freed / Agents 不是调用点手工维护的，而是每次落盘前从 Result 与
+// agents 集合重新算出来，避免「某次追加忘了同步摘要」这种只在中途崩溃时
+// 才暴露的偏差。
+func (w *journalWriter) save() error {
+	w.j.Count = w.res.Count
+	w.j.Freed = w.res.Freed
+	w.j.Agents = sortedKeys(w.agents)
+	if err := w.c.writeJournal(w.j); err != nil {
+		return err
+	}
+	w.onDisk = journalSnapshot{
+		moved:   len(w.j.Moved),
+		sqlite:  len(w.j.SQLite),
+		indexes: len(w.j.Indexes),
+	}
+	return nil
+}
+
+// failure 把「删到一半 journal 写不进去」的边界说清楚：已经计入 Result 的条数、
+// 磁盘上最后一份完整 journal 覆盖到哪、内存里还有多少条没落盘。
+func (w *journalWriter) failure(cause error) error {
+	return fmt.Errorf(
+		"clean: 写 journal 失败，已停止后续删除（batch %s；已成功删除 %d 条会话；"+
+			"磁盘上最后一份完整 journal 含 %d 项移动、%d 项数据库、%d 项索引；"+
+			"此后未落盘的有 %d 项移动、%d 项数据库、%d 项索引）: %w",
+		w.j.BatchID, w.res.Count,
+		w.onDisk.moved, w.onDisk.sqlite, w.onDisk.indexes,
+		len(w.j.Moved)-w.onDisk.moved,
+		len(w.j.SQLite)-w.onDisk.sqlite,
+		len(w.j.Indexes)-w.onDisk.indexes,
+		cause)
+}
+
 // Delete 删除一批会话。
 //
-// 流程固定为：校验模式 -> 预留批次目录（同时确定 batchID）-> 删正文 -> 删 SQLite 行
-// -> 裁索引 -> 落 journal。任何单条失败都只进 Result.Errors，不影响其余会话；
-// 只有「批次目录建不出来」或「journal 写不进去」这种会让整批失去可撤销性的问题
-// 才返回 error。
+// 流程固定为：校验模式 -> 预留批次目录（同时确定 batchID）-> 先落一份空 journal
+// -> 删正文 -> 删 SQLite 行 -> 裁索引 -> 收尾重写 journal。journal 必须在任何
+// 破坏性动作之前就存在，并且每完成一次动作就原子重写一次：进程中途被 kill 时，
+// 磁盘上至少有一份能说明「已经动了哪些路径」的账本。
+//
+// 任何单条失败都只进 Result.Errors，不影响其余会话；只有「批次目录建不出来」或
+// 「journal 写不进去」这种会让整批失去可撤销性的问题才返回 error。后者会立即
+// 停手——继续删只会扩大无法撤销的范围。
 func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Session) (Result, error) {
 	if c.opts.Mode != ModeTrash && c.opts.Mode != ModePermanent {
 		return Result{Errors: []ItemError{}},
@@ -140,6 +207,11 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 	deleted := map[string]bool{} // 正文确实消失了的 ID，索引只裁这些
 	agents := map[string]bool{}
 
+	writer := newJournalWriter(c, j, &res, agents)
+	if err := writer.save(); err != nil {
+		return res, fmt.Errorf("clean: 写初始 journal 失败，未开始删除（batch %s）: %w", batchID, err)
+	}
+
 	var fileSessions, sqliteSessions []session.Session
 	for _, s := range sessions {
 		if s.Storage == session.StorageSQLite {
@@ -164,26 +236,48 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 	}
 
 	for _, s := range fileSessions {
-		if c.deleteFileSession(s, home, trashRoot, trashErr, j, &res) {
+		ok, err := c.deleteFileSession(s, home, trashRoot, trashErr, j, &res, writer)
+		if ok {
+			// 先记账再落盘：即使紧接着的写盘失败，Result 也能准确告诉上层
+			// 这条会话已经删掉了。
 			res.Count++
 			addDeletedID(deleted, s)
 			addAgent(agents, s, spec)
+		}
+		if err != nil {
+			return res, writer.failure(err)
+		}
+		if ok {
+			if err := writer.save(); err != nil {
+				return res, writer.failure(err)
+			}
 		}
 	}
 
 	if len(sqliteSessions) > 0 {
 		c.deleteSQLiteSessions(spec, home, sqliteSessions, trashRoot, trashErr, j, &res, namer, deleted, agents)
+		// deleteSidecars 在 sqlite.go 里被调用，无法返回 error；它把第一次
+		// 写盘失败记在 journal 上，这里统一停手。
+		if j.persistErr != nil {
+			return res, writer.failure(j.persistErr)
+		}
+		if err := writer.save(); err != nil {
+			return res, writer.failure(err)
+		}
 	}
 
 	if len(deleted) > 0 {
 		c.trimIndexes(spec, home, deleted, j, &res, namer)
+		if j.persistErr != nil {
+			return res, writer.failure(j.persistErr)
+		}
+		if err := writer.save(); err != nil {
+			return res, writer.failure(err)
+		}
 	}
 
-	j.Count = res.Count
-	j.Freed = res.Freed
-	j.Agents = sortedKeys(agents)
-	if err := c.writeJournal(j); err != nil {
-		return res, fmt.Errorf("clean: 写 journal 失败，本批次无法撤销: %w", err)
+	if err := writer.save(); err != nil {
+		return res, writer.failure(err)
 	}
 	return res, nil
 }
@@ -192,20 +286,24 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 //
 // 先校验全部路径再动手，而不是边校验边删：一条会话可能同时带正文和旁挂目录，
 // 如果第一个删了、第二个越界被拒，用户会得到一个半删状态，比整条拒绝更难解释。
+//
+// 每成功移走/删掉一个路径就立刻落一次 journal：崩溃发生在这里时，已经离开原位的
+// 文件仍然在账本里。写盘失败返回 error，调用方必须停止整批删除。
 func (c *Cleaner) deleteFileSession(
 	s session.Session,
 	home, trashRoot string,
 	trashErr error,
 	j *journal,
 	res *Result,
-) bool {
+	writer *journalWriter,
+) (bool, error) {
 	if len(s.Paths) == 0 {
 		res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: "没有可删除的路径"})
-		return false
+		return false, nil
 	}
 	if home == "" {
 		res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: "数据根为空，无法做路径越界检查"})
-		return false
+		return false, nil
 	}
 
 	bad := false
@@ -216,11 +314,11 @@ func (c *Cleaner) deleteFileSession(
 		}
 	}
 	if bad {
-		return false
+		return false, nil
 	}
 
 	ok := true
-	for _, path := range s.Paths {
+	for i, path := range s.Paths {
 		if c.opts.Mode == ModeTrash {
 			if trashErr != nil {
 				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: trashErr.Error()})
@@ -234,6 +332,11 @@ func (c *Cleaner) deleteFileSession(
 				continue
 			}
 			j.Moved = append(j.Moved, journalMoved{Orig: path, Trashed: dest})
+			if err := writer.save(); err != nil {
+				// 只有已经处理完所有路径时，这条会话才算完整删除；
+				// 否则调用方不能把它计入 Result.Count。
+				return ok && i == len(s.Paths)-1, err
+			}
 			continue
 		}
 
@@ -244,14 +347,20 @@ func (c *Cleaner) deleteFileSession(
 			continue
 		}
 		res.Freed += size
+		if err := writer.save(); err != nil {
+			return ok && i == len(s.Paths)-1, err
+		}
 	}
-	return ok
+	return ok, nil
 }
 
 // deleteSidecars 删除 SQLite 型会话的旁挂文件 / 目录。
 //
 // 与 deleteFileSession 分开：那边「任一路径失败 = 整条会话不删」，
 // 这里行已经删了，旁挂目录失败只能记账 —— 语义不同，不能复用。
+//
+// 签名由 sqlite.go 的调用点固定，不能返回 error；journal 写盘失败记录在
+// j.persistErr 上，Delete 在 SQLite 阶段结束后检查并停止后续破坏。
 func (c *Cleaner) deleteSidecars(
 	s session.Session,
 	home, trashRoot string,
@@ -260,6 +369,10 @@ func (c *Cleaner) deleteSidecars(
 	res *Result,
 ) {
 	for _, path := range s.Paths {
+		// 上一轮已经写 journal 失败：不再移走任何东西，等 Delete 收尾报错。
+		if j.persistErr != nil {
+			return
+		}
 		if path == "" {
 			continue
 		}
@@ -278,6 +391,10 @@ func (c *Cleaner) deleteSidecars(
 				continue
 			}
 			j.Moved = append(j.Moved, journalMoved{Orig: path, Trashed: dest})
+			if err := j.save(); err != nil {
+				j.persistErr = err
+				return
+			}
 			continue
 		}
 		size := fsx.Size(path)
@@ -286,6 +403,10 @@ func (c *Cleaner) deleteSidecars(
 			continue
 		}
 		res.Freed += size
+		if err := j.save(); err != nil {
+			j.persistErr = err
+			return
+		}
 	}
 }
 
