@@ -119,6 +119,13 @@ func (c *Client) Install(ctx context.Context, release *Release, target, workDir 
 		return InstallResult{}, fmt.Errorf("%s 不是 .app", target)
 	}
 
+	// 当前版本要在下载之前确定：拿不到就直接拒装，既省掉白下载几十 MB，
+	// 也保证任何失败路径都没有碰过旧包。降级保护依赖它，理由见 currentVersion。
+	current, err := c.currentVersion(target)
+	if err != nil {
+		return InstallResult{}, err
+	}
+
 	asset, err := c.AssetFor(release)
 	if err != nil {
 		return InstallResult{}, err
@@ -193,7 +200,7 @@ func (c *Client) Install(ctx context.Context, release *Release, target, workDir 
 	if normalizeVersion(extractedVersion) != normalizeVersion(release.Version) {
 		return InstallResult{}, fmt.Errorf("包内版本 %s 与发布 %s 不一致", extractedVersion, release.Version)
 	}
-	if !IsNewer(c.currentVersion(), extractedVersion) {
+	if !IsNewer(current, extractedVersion) {
 		return InstallResult{}, fmt.Errorf("下载到的版本 %s 不比当前版本新", extractedVersion)
 	}
 	// 架构不对的包装上去只会「更新完打不开」，宁可现在拒绝。lipo 不存在时跳过。
@@ -213,14 +220,42 @@ func (c *Client) Install(ctx context.Context, release *Release, target, workDir 
 	return InstallResult{Path: target, Version: extractedVersion, PreviousVersion: previous}, nil
 }
 
-// currentVersion 由 NewClient 的 UserAgent 反推，避免 Install 再多一个参数。
-// 用 UserAgent 而不是新增字段，是因为调用方已经在构造它时知道版本了。
-func (c *Client) currentVersion() string {
+// currentVersion 确定「当前正在运行的版本」，取不到时返回错误而不是兜底值。
+//
+// 两个来源，按可信度排：
+//  1. 目标 .app 的 CFBundleShortVersionString —— 磁盘上真实在跑的那份包；
+//  2. UserAgent 里的 AgentSweep/<版本> —— 调用方自报，格式可能偏、也可能是
+//     被打包脚本写死的历史值。
+//
+// 特别注意**不能**再用 "dev" 之类解析不了的值兜底：Install 的降级保护是
+// `!IsNewer(current, extracted)`，而 IsNewer 对解析不了的 current 是放行策略
+// （开发构建不阻塞更新）。若当前版本退化成 "dev"，任意旧发布包、乃至被重放的
+// 旧包都能通过校验装回去 —— 等于把「必须比当前新」这条防线关掉。所以两个
+// 来源都不可用时，这里返回错误，让调用方拒绝安装。
+//
+// 「可用」的标准是能按项目宽松规则解析成版本号（ParseVersion）：plist 里写了
+// 一句非版本字符串，与读不到同样无法参与比较，不能当作有效来源往下走。
+func (c *Client) currentVersion(target string) (string, error) {
+	if version, err := bundleVersion(target); err == nil {
+		if version = strings.TrimSpace(version); usableVersion(version) {
+			return version, nil
+		}
+	}
 	const prefix = "AgentSweep/"
 	if strings.HasPrefix(c.UserAgent, prefix) {
-		return strings.TrimPrefix(c.UserAgent, prefix)
+		if version := strings.TrimSpace(strings.TrimPrefix(c.UserAgent, prefix)); usableVersion(version) {
+			return version, nil
+		}
 	}
-	return "dev"
+	return "", fmt.Errorf(
+		"无法确定当前版本（%s 里读不到可用的 CFBundleShortVersionString，UserAgent %q 也不是 AgentSweep/<版本号>），拒绝自动更新以免降级",
+		target, c.UserAgent)
+}
+
+// usableVersion 判断一个自报版本能否参与新旧比较。
+func usableVersion(raw string) bool {
+	_, err := ParseVersion(raw)
+	return err == nil
 }
 
 // extractApp 解压 zip 并返回其中的 .app 目录。
