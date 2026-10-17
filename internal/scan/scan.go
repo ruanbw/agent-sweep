@@ -50,6 +50,82 @@ type AgentResult struct {
 	Err        string            `json:"err,omitempty"`
 }
 
+// scanNotice 是一条「扫描照常完成，但用户该知道」的提示。
+//
+// 不直接写 AgentResult.Err 是因为文件型 Store 在 worker 池里并发解析：
+// 并发写同一个结果需要额外加锁，而这里只要各批解析自己收集、回到 One 再按
+// key 去重，既没有数据竞争，也不会让同一条提示按会话数重复刷屏。
+type scanNotice struct {
+	key  string
+	text string
+}
+
+// addNotice 按 key 去重后追加。
+//
+// 同一 key 只保留第一次出现的正文（含最具体的路径示例），所以一万条
+// 越界会话也只会在 Err 里留下一行。
+func addNotice(dst *[]scanNotice, notice scanNotice) {
+	if notice.key == "" {
+		notice.key = notice.text
+	}
+	for _, existing := range *dst {
+		if existing.key == notice.key {
+			return
+		}
+	}
+	*dst = append(*dst, notice)
+}
+
+// scanNoticeError 把「非致命提示」和「真正的错误」一起交回调用方。
+//
+// scanFiles / scanDirs / scanSQLite 的签名被既有测试锁定为 (items, error)，
+// 提示又必须离开 worker 池才能汇总，所以用这个 error 当载体：One 用
+// errors.As 取出 notices 后只把 err 交给 mergeStore，Err 的拼接语义不变。
+type scanNoticeError struct {
+	notices []scanNotice
+	err     error
+}
+
+func (e *scanNoticeError) Error() string {
+	parts := make([]string, 0, len(e.notices)+1)
+	if e.err != nil {
+		parts = append(parts, e.err.Error())
+	}
+	for _, notice := range e.notices {
+		parts = append(parts, notice.text)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (e *scanNoticeError) Unwrap() error { return e.err }
+
+func wrapScanNotices(notices []scanNotice, err error) error {
+	if len(notices) == 0 {
+		return err
+	}
+	return &scanNoticeError{notices: notices, err: err}
+}
+
+// appendScanNotices 把去重后的提示并进 AgentResult.Err。
+//
+// 统一加「警告：」前缀，UI 才能把「扫描成功但有不确定的地方」与真正的
+// 失败区分开；提示之间用「；」连接，不让 Err 长成一串分号。
+func appendScanNotices(result *AgentResult, notices []scanNotice) {
+	if len(notices) == 0 {
+		return
+	}
+	texts := make([]string, 0, len(notices))
+	for _, notice := range notices {
+		texts = append(texts, notice.text)
+	}
+	warning := "警告：" + strings.Join(texts, "；")
+	if result.Err != "" {
+		result.Err += "; " + warning
+	} else {
+		result.Err = warning
+	}
+}
+
 // All 并发扫描全部 Agent。
 //
 // 一个 Agent 挂掉不能拖垮整次扫描：每个 Agent 的错误收进 Err 带回 UI，
@@ -110,12 +186,25 @@ func One(spec catalog.Spec) AgentResult {
 	result.Home = home
 
 	seen := map[string]bool{}
+	// 提示（越界的 assoc、静默的列回退）先各 Store 收集，最后统一去重并入 Err。
+	// 不能由并发的文件解析直接写 result.Err：那既会竞争，也会让同一条提示
+	// 按会话数重复一遍。
+	var notices []scanNotice
 	// 同一个 sessionId 可能在多个 Store 里出现（Claude Code 的 projects/ 与 sessions/）。
 	// 先到先得：Store 的声明顺序就是优先级。
 	for _, store := range spec.Stores {
 		items, err := scanStore(spec, home, store)
+		var noticeErr *scanNoticeError
+		if errors.As(err, &noticeErr) {
+			for _, notice := range noticeErr.notices {
+				addNotice(&notices, notice)
+			}
+			// mergeStore 只该看到真正的错误，既有拼接语义保持不变。
+			err = noticeErr.err
+		}
 		mergeStore(&result, seen, items, err)
 	}
+	appendScanNotices(&result, notices)
 
 	sort.SliceStable(result.Sessions, func(i, j int) bool {
 		return result.Sessions[i].UpdatedAt.After(result.Sessions[j].UpdatedAt)
@@ -217,7 +306,13 @@ func scanFiles(spec catalog.Spec, home string, store catalog.Store, jsonl bool) 
 	// 用指针槽位而不是 make([]session.Session, len(files))：后者会为几万个
 	// 文件先分配一整片零值结构体，而真正解析成功的只是其中一部分。空槽位
 	// 也保留了「按下标写、按下标读」的顺序语义。
-	slots := make([]*session.Session, len(files))
+	//
+	// notices 跟着槽位一起带回来：worker 里不能碰共享的 AgentResult。
+	type fileSlot struct {
+		item    *session.Session
+		notices []scanNotice
+	}
+	slots := make([]fileSlot, len(files))
 	forEachFile(files, scanWorkers, func(i int, file string) {
 		info, err := os.Stat(file)
 		if err != nil || info.IsDir() {
@@ -225,20 +320,29 @@ func scanFiles(spec catalog.Spec, home string, store catalog.Store, jsonl bool) 
 			// 和目录都静默跳过，不中断其它文件的解析。
 			return
 		}
-		item := buildFileSession(spec, home, store, file, info, jsonl)
-		slots[i] = &item
+		item, notices := buildFileSessionWithNotices(spec, home, store, file, info, jsonl)
+		slots[i] = fileSlot{item: &item, notices: notices}
 	})
 
 	out := make([]session.Session, 0, len(slots))
-	for _, item := range slots {
-		if item != nil && item.ID != "" {
-			out = append(out, *item)
+	var notices []scanNotice
+	for _, slot := range slots {
+		if slot.item != nil && slot.item.ID != "" {
+			out = append(out, *slot.item)
+		}
+		for _, notice := range slot.notices {
+			addNotice(&notices, notice)
 		}
 	}
-	return out, nil
+	return out, wrapScanNotices(notices, nil)
 }
 
 func buildFileSession(spec catalog.Spec, home string, store catalog.Store, file string, info os.FileInfo, jsonl bool) session.Session {
+	item, _ := buildFileSessionWithNotices(spec, home, store, file, info, jsonl)
+	return item
+}
+
+func buildFileSessionWithNotices(spec catalog.Spec, home string, store catalog.Store, file string, info os.FileInfo, jsonl bool) (session.Session, []scanNotice) {
 	id := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
 	// 文件名里带 uuid 的（Codex 的 rollout-…-<uuid>、Pi 的 <时间>_<uuid>）取 uuid 段：
 	// 前缀是时间戳，会随每次导出变化，不是稳定 id。
@@ -272,7 +376,8 @@ func buildFileSession(spec catalog.Spec, home string, store catalog.Store, file 
 
 	// 旁挂路径：`{id}` 相对会话文件所在目录，`/{id}` 相对 Agent 数据根。
 	dir := filepath.Dir(file)
-	applyAssoc(home, dir, store.Assoc, id, &item)
+	var notices []scanNotice
+	applyAssoc(home, dir, store.Assoc, id, &item, &notices)
 	// 会话正在使用时，Agent 会持有这个 lock 文件（flock）。
 	// 试一次非阻塞独占锁：拿不到 = 有人在用。这比看 mtime 准得多 ——
 	// mtime 只能说明「最近写过」，而一个刚被读过的旧会话 mtime 不会变。
@@ -281,13 +386,14 @@ func buildFileSession(spec catalog.Spec, home string, store catalog.Store, file 
 		filepath.Join(dir, id+".lock"),
 		filepath.Join(dir, "session.lock"),
 	))
-	return item
+	return item, notices
 }
 
 // scanDirs 处理「一个子目录 = 一条会话」。
 func scanDirs(spec catalog.Spec, home string, store catalog.Store) ([]session.Session, error) {
 	entries := fsx.Glob(home, store.Glob)
 	var out []session.Session
+	var notices []scanNotice
 	for _, dir := range entries {
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
@@ -330,11 +436,11 @@ func scanDirs(spec catalog.Spec, home string, store catalog.Store) ([]session.Se
 		if item.Snippet == "" {
 			item.Snippet = item.Project
 		}
-		applyAssoc(home, dir, store.Assoc, id, &item)
+		applyAssoc(home, dir, store.Assoc, id, &item, &notices)
 		item.Active = activeFromLock(sessionLockState(filepath.Join(dir, "session.lock")))
 		out = append(out, item)
 	}
-	return out, nil
+	return out, wrapScanNotices(notices, nil)
 }
 
 // scanSQLite 读表里的会话行。
@@ -379,10 +485,24 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 		index[strings.ToLower(name)] = i
 	}
 
-	idIdx := resolveColumn(index, store.IDCol, "id", "session_id", "conversation_id", "thread_id", "uuid")
-	titleIdx := resolveColumn(index, store.TitleCol, "title", "name", "summary", "slug", "preview")
-	timeIdx := resolveColumn(index, store.TimeCol, "time_updated", "updated_at", "updatedat", "last_modified_time", "last_modified", "mtime", "timestamp", "created_at")
-	cwdIdx := resolveColumn(index, store.CWDCol, "directory", "cwd", "project", "workspace", "folder_paths", "path")
+	idChoice := resolveColumn(index, "idCol", store.IDCol, "id", "session_id", "conversation_id", "thread_id", "uuid")
+	titleChoice := resolveColumn(index, "titleCol", store.TitleCol, "title", "name", "summary", "slug", "preview")
+	timeChoice := resolveColumn(index, "timeCol", store.TimeCol, "time_updated", "updated_at", "updatedat", "last_modified_time", "last_modified", "mtime", "timestamp", "created_at")
+	cwdChoice := resolveColumn(index, "cwdCol", store.CWDCol, "directory", "cwd", "project", "workspace", "folder_paths", "path")
+
+	// R17：列名回退以前是完全静默的。只有真正发生回退才记，显式配置命中时
+	// 一条都不产生；按「表 + 角色 + 实际列」去重，同一个 Store 重复扫描也
+	// 不会多刷一行。
+	var notices []scanNotice
+	for _, choice := range []columnChoice{idChoice, titleChoice, timeChoice, cwdChoice} {
+		if !choice.fallback {
+			continue
+		}
+		addNotice(&notices, scanNotice{
+			key:  "column:" + store.Table + ":" + choice.role + ":" + choice.name,
+			text: choice.warning(store.Table),
+		})
+	}
 
 	var out []session.Session
 	for rows.Next() {
@@ -394,7 +514,7 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 		if err := rows.Scan(ptrs...); err != nil {
 			continue
 		}
-		id := stringValue(pick(values, idIdx))
+		id := stringValue(pick(values, idChoice.index))
 		if id == "" {
 			continue
 		}
@@ -402,12 +522,12 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 			ID:      id,
 			UID:     spec.ID + ":" + id,
 			AgentID: spec.ID,
-			Title:   stringValue(pick(values, titleIdx)),
-			Project: stringValue(pick(values, cwdIdx)),
+			Title:   stringValue(pick(values, titleChoice.index)),
+			Project: stringValue(pick(values, cwdChoice.index)),
 			Storage: session.StorageSQLite,
 			Bytes:   0, // SQLite 删行不释放空间，真实释放量在 clean 里按文件差算
 		}
-		raw := pick(values, timeIdx)
+		raw := pick(values, timeChoice.index)
 		if t, ok := sqliteTime(raw); ok {
 			item.UpdatedAt = t
 		} else {
@@ -417,12 +537,12 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 			item.Title = fallbackTitle(id)
 		}
 		item.Snippet = item.Project
-		applyAssoc(home, home, store.Assoc, id, &item)
+		applyAssoc(home, home, store.Assoc, id, &item, &notices)
 		out = append(out, item)
 	}
 	// 迭代到一半超时/被占时 rows.Err() 才会说话；此时 out 里已有的行照样返回，
 	// mergeStore 会把它们收下并把错误记进 AgentResult.Err（见 partial_test.go）。
-	return out, sqliteQueryError(dbPath, rows.Err())
+	return out, wrapScanNotices(notices, sqliteQueryError(dbPath, rows.Err()))
 }
 
 // SQLite 扫描的两层时间上限。取值理由见下；两者必须一起看。
@@ -555,18 +675,44 @@ func pick(values []any, idx int) any {
 	return values[idx]
 }
 
-func resolveColumn(index map[string]int, preferred string, candidates ...string) int {
+// columnChoice 记录一次「从表里挑列」的结果，以及它是显式命中还是回退。
+//
+// 把实际列名与配置列名一起带出来，是为了让回退可观测：只返回下标的话，
+// 绑定到 path / created_at 这类泛化名字时用户完全看不出来（R17）。
+type columnChoice struct {
+	index     int
+	name      string // 实际使用的列名（小写）
+	preferred string // 配置里明确写的列名；空表示没配
+	role      string // idCol / titleCol / timeCol / cwdCol
+	fallback  bool
+}
+
+// warning 生成一条用户能读懂的说明。只有 fallback 为真时才该调用。
+func (c columnChoice) warning(table string) string {
+	if c.preferred == "" {
+		return fmt.Sprintf("表 %s 未声明 %s，回退到列 %s", table, c.role, c.name)
+	}
+	return fmt.Sprintf("表 %s 配置的 %s=%q 不存在，回退到列 %s", table, c.role, c.preferred, c.name)
+}
+
+// resolveColumn 优先用配置的列名；配置缺失或列不存在时才退回候选列。
+//
+// 返回值带上「实际用了哪一列、是否回退」，调用方才能把以前完全静默的回退
+// 报出来。candidates 的顺序就是优先级，命中第一个即止。
+func resolveColumn(index map[string]int, role, preferred string, candidates ...string) columnChoice {
 	if preferred != "" {
-		if i, ok := index[strings.ToLower(preferred)]; ok {
-			return i
+		key := strings.ToLower(preferred)
+		if i, ok := index[key]; ok {
+			return columnChoice{index: i, name: key, preferred: preferred, role: role}
 		}
 	}
 	for _, name := range candidates {
-		if i, ok := index[strings.ToLower(name)]; ok {
-			return i
+		key := strings.ToLower(name)
+		if i, ok := index[key]; ok {
+			return columnChoice{index: i, name: key, preferred: preferred, role: role, fallback: true}
 		}
 	}
-	return -1
+	return columnChoice{index: -1, preferred: preferred, role: role}
 }
 
 func stringValue(value any) string {
@@ -669,7 +815,12 @@ func sessionLockState(paths ...string) lockState {
 // `{id}` 相对 base（文件型会话是文件所在目录，目录型是会话目录本身），
 // `/{id}` 相对 Agent 数据根。两种作用域都要支持：Claude Code 的子代理目录在
 // 项目目录下，文件快照却在数据根下。
-func applyAssoc(home, base string, patterns []string, id string, item *session.Session) {
+//
+// 解析结果必须严格落在数据根内才收：filepath.Join 会先 Clean 掉 `..`，
+// 一个自定义适配器写的 `../../outside` 会直接变成数据根之外的路径。删不删
+// 得掉由 clean 的 checkPathInHome 兜底，但扫描结果本身不能先不可信 —— UI
+// 会展示它，Bytes 也会把别人的文件算进来（R15）。
+func applyAssoc(home, base string, patterns []string, id string, item *session.Session, notices *[]scanNotice) {
 	for _, pattern := range patterns {
 		rel := strings.ReplaceAll(pattern, "{id}", id)
 		var target string
@@ -677,6 +828,16 @@ func applyAssoc(home, base string, patterns []string, id string, item *session.S
 			target = filepath.Join(home, rel[1:])
 		} else {
 			target = filepath.Join(base, rel)
+		}
+		// 必须在 Join 之后判断包含性：原始 pattern 里看不到 Clean 的结果。
+		if !assocWithinHome(home, target) {
+			if notices != nil {
+				addNotice(notices, scanNotice{
+					key:  "assoc:" + pattern,
+					text: fmt.Sprintf("旁挂模板 %q 解析出的路径越出数据根 %s，已跳过：%s", pattern, home, target),
+				})
+			}
+			continue
 		}
 		if !fsx.Exists(target) {
 			continue
@@ -694,6 +855,28 @@ func applyAssoc(home, base string, patterns []string, id string, item *session.S
 		item.Paths = append(item.Paths, target)
 		item.Bytes += fsx.Size(target)
 	}
+}
+
+// assocWithinHome 判断 assoc 解析出的路径是否严格位于数据根 home 内。
+//
+// 只做词法判断：这里的目标是「不要把越界路径收进扫描结果」，不需要 clean
+// 包 checkPathInHome 那层真实路径语义（scan 也不能 import clean，会成环）。
+// 符号链接造成的越界仍由删除侧的 checkPathInHomeReal 兜底；扫描侧宁可只
+// 拒绝显式 `..`，也不跟随链接去猜。
+func assocWithinHome(home, target string) bool {
+	if strings.TrimSpace(home) == "" || strings.TrimSpace(target) == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(home), filepath.Clean(target))
+	if err != nil || filepath.IsAbs(rel) {
+		return false
+	}
+	// "." 是数据根本身，不是某条会话的旁挂产物；收进删除清单等于把整个
+	// Agent 根挂到这条会话上。
+	if rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // decodeProjectDir 把 `--Users-me-proj--` / `-Users-me-proj` 还原成 `/Users/me/proj`。
