@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"os"
 	"path"
 	"strings"
 
@@ -48,8 +49,12 @@ func staticHandler() http.Handler {
 // Serve 只起 HTTP 服务，不开窗口。用于调试与无窗口环境。
 func Serve(addr, version string) error {
 	service := NewService(version)
+	// 从浏览器里点「下载并安装」时也要能完成重启：服务进程直接退出，
+	// 交给 RelaunchAfterExit 写的脚本拉起新包。
+	service.onRestart = func() { os.Exit(0) }
 	server := &http.Server{Addr: addr, Handler: service.Handler()}
 	fmt.Printf("AgentSweep %s · http://%s\n", version, addr)
+	go service.autoCheckUpdates()
 	return server.ListenAndServe()
 }
 
@@ -76,6 +81,10 @@ func Run(version string) error {
 		MinHeight: 560,
 		URL:       "/",
 	})
+
+	// 更新装好后旧进程必须退出：脚本会等这个 PID 消失，再 open 新包。
+	service.onRestart = func() { app.Quit() }
+	go service.autoCheckUpdates()
 
 	return app.Run()
 }

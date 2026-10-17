@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"github.com/ruanbw/agent-sweep/internal/probe"
 	"github.com/ruanbw/agent-sweep/internal/scan"
 	"github.com/ruanbw/agent-sweep/internal/session"
+	"github.com/ruanbw/agent-sweep/internal/update"
 )
 
 var version = "dev"
@@ -52,6 +54,8 @@ func main() {
 		runDiscover(args[1:])
 	case "serve":
 		runServe(args[1:])
+	case "update":
+		runUpdate(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println(version)
 	case "help", "--help", "-h":
@@ -74,6 +78,7 @@ func usage() {
   agentsweep clean --agent <id> --permanent
   agentsweep discover [--json]       找目录里没有的 Agent
   agentsweep serve [--addr host:port] 只开 HTTP 服务（调试 UI / 无窗口环境）
+  agentsweep update [--check]        检查并安装新版本（GUI 里也能做）
   agentsweep version
 `)
 }
@@ -205,6 +210,73 @@ func runServe(args []string) {
 		fmt.Fprintln(os.Stderr, "serve:", err)
 		os.Exit(1)
 	}
+}
+
+// runUpdate 把 GUI 的更新流程搬进终端。
+//
+// 它和 GUI 走同一个 internal/update 包：挑包、校验、替换是同一份实现，
+// 所以不会出现「CLI 说装好了、GUI 又说有更新」这种两边各有一套规则的分叉。
+func runUpdate(args []string) {
+	flags := flag.NewFlagSet("update", flag.ExitOnError)
+	checkOnly := flags.Bool("check", false, "只检查，不安装")
+	asJSON := flags.Bool("json", false, "输出 JSON（不安装）")
+	_ = flags.Parse(args)
+
+	client := update.NewClient(version)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	release, err := client.Latest(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "检查更新失败：", err)
+		os.Exit(1)
+	}
+	available := update.IsNewer(version, release.Version)
+
+	if *asJSON {
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		encoder.SetEscapeHTML(false)
+		_ = encoder.Encode(map[string]any{
+			"current":   version,
+			"latest":    release.Version,
+			"available": available,
+			"pageUrl":   release.PageURL,
+		})
+		return
+	}
+
+	fmt.Printf("当前 %s · 最新 %s\n", version, release.Version)
+	if !available {
+		fmt.Println("已是最新版本。")
+		return
+	}
+	fmt.Printf("新版本 %s 可用：%s\n", release.Version, release.PageURL)
+	if *checkOnly {
+		return
+	}
+
+	target, err := update.DetectBundle()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "自动安装跳过：", err)
+		fmt.Printf("请从发布页手动下载：%s\n", release.PageURL)
+		os.Exit(2)
+	}
+
+	installCtx, installCancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer installCancel()
+	result, err := client.Install(installCtx, release, target, update.DefaultWorkDir(), func(percent int, note string) {
+		fmt.Fprintf(os.Stderr, "\r%3d%% %s", percent, note)
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "\n安装失败：", err)
+		os.Exit(1)
+	}
+	if result.PreviousVersion == "" {
+		fmt.Printf("\r已更新到 %s · %s\n", result.Version, result.Path)
+		return
+	}
+	fmt.Printf("\r已更新 %s → %s · %s\n", result.PreviousVersion, result.Version, result.Path)
 }
 
 // runDiscover 打印指纹发现的候选。

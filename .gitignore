@@ -1,4 +1,5 @@
 bin/
+dist/
 AgentSweep.app/
 *.app/
 .DS_Store

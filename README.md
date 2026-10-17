@@ -1,6 +1,7 @@
 # AgentSweep
 
 扫描本机所有 AI Agent 的会话记录，勾选后清理。**默认进废纸篓，可撤销。**
+每个 Agent 都带官方图标：内置目录用随二进制分发的品牌矢量图，装了桌面版的 Agent 直接从 `.app` 取。
 
 <p align="center"><sub>Go + Wails v3 + 系统 WKWebView + 手写前端（无框架、无 bundler、无 bindings 生成器）</sub></p>
 
@@ -9,6 +10,37 @@
 <sub>截图是内置演示数据（`index.html` 双击即可打开），不是真实会话。</sub>
 
 ---
+
+## 下载与安装
+
+从 [Releases](https://github.com/ruanbw/agent-sweep/releases) 下载最新版的
+`AgentSweep-v<版本>-darwin-universal.zip`（Apple Silicon 与 Intel 通用），解压后把
+`AgentSweep.app` 拖进「应用程序」。
+
+当前产物是 ad-hoc 签名、未做 Apple 公证。首次打开如果被 Gatekeeper 拦下：
+右键 `AgentSweep.app` →「打开」，或执行一次
+
+```bash
+xattr -dr com.apple.quarantine /Applications/AgentSweep.app
+```
+
+只要命令行的话：下载 `agentsweep-v<版本>-darwin-universal.tar.gz`，解压得到单个 `agentsweep`
+二进制，放进 `PATH` 即可。同页的 `checksums.txt` 是 sha256 清单：
+
+```bash
+cd ~/Downloads && shasum -a 256 -c checksums.txt
+```
+
+版本号与产物命名规则（也就是应用内更新器的选包契约）见 [`docs/RELEASING.md`](docs/RELEASING.md)。
+
+## 自动更新
+
+应用启动后会检查一次 GitHub Releases。有新版本时界面上会提示，点「下载并安装」后自动替换、
+重启生效；下载的包会用 `checksums.txt` 里的 sha256 校验，只接受本仓库 Release 的产物。
+不想被提示可以在设置里关掉自动检查。
+
+自动更新和手动覆盖 `/Applications/AgentSweep.app` 等价。用户数据（索引、journal、适配器）在
+`~/Library/Application Support/AgentSweep/`，不会随 .app 一起被替换。
 
 ## 为什么重做
 
@@ -57,6 +89,19 @@ SQLite 里有没有 `session`/`thread`/`message` 表、目录结构是不是「�
 
 **「进废纸篓」不计入「已释放空间」** —— 它没释放。UI 上这两个数字分开说。
 
+## UI / UX 设计
+
+完整的设计方案、设计系统与可点击高保真原型在 [`docs/design/`](docs/design/README.md)：
+
+- [`DESIGN.md`](docs/design/DESIGN.md)：颜色/字体/间距/组件/动效/无障碍
+- [`ux-flows.md`](docs/design/ux-flows.md)：信息架构、9 条核心流程、文案库
+- [`prototype/index.html`](docs/design/prototype/index.html)：双击即可操作的高保真原型
+- [`qa-report.md`](docs/design/qa-report.md)：26 张状态截图与交互/无障碍/响应式验收
+
+```bash
+open docs/design/prototype/index.html
+```
+
 ## 架构
 
 ```
@@ -67,6 +112,7 @@ internal/session/          统一会话模型 + 各格式解析启发式
 internal/scan/             只读扫描引擎（并发、按 Agent 隔离错误）
 internal/clean/            备份 → 进废纸篓 / 删行 → 裁索引 → journal → 撤销
 internal/gui/              Wails v3 壳 + 同一个 http.Handler 上的静态资源与 /api
+internal/gui/icons.go      macOS .app 官方图标提取 + 缓存（GET /api/icon）
 internal/gui/assets/       手写 HTML/CSS/JS，embed 进二进制
 ```
 
@@ -80,9 +126,11 @@ make build      # bin/AgentSweep
 make app        # AgentSweep.app（手工拼 bundle，不依赖 wails CLI）
 make run        # 构建并打开
 make test
+make dist VERSION=0.1.0   # 发版产物：通用 .app zip + CLI tar.gz + checksums.txt
 ```
 
-要求：Go 1.25+、Xcode Command Line Tools（cgo 链接 WebKit）。macOS 12+。
+要求：Go 1.27+、Xcode Command Line Tools（cgo 链接 WebKit）。macOS 13+。
+发版流程（tag、产物命名、回滚）见 [`docs/RELEASING.md`](docs/RELEASING.md)。
 
 ## CLI
 

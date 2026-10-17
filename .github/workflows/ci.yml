@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# 只读。CI 不产物件、不碰 Release，发版全部由 release.yml 负责。
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # 版本只认 go.mod，升级 Go 时不需要回来改 workflow。
+          go-version-file: go.mod
+          cache: true
+
+      # cgo 链接系统 WebKit，macos-latest 自带完整 Xcode，不需要额外装依赖。
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...

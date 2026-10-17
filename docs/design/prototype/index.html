@@ -1,0 +1,1140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>AgentSweep · 原型</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+<a class="skip-link" href="#sessionTable">跳到会话列表</a>
+
+<svg class="sprite" aria-hidden="true" focusable="false" width="0" height="0">
+  <symbol id="i-scan" viewBox="0 0 24 24">
+    <path d="M21 4v6h-6"></path>
+    <path d="M3 20v-6h6"></path>
+    <path d="M5.1 9.5A8 8 0 0 1 19.3 6L21 8.5"></path>
+    <path d="M18.9 14.5A8 8 0 0 1 4.7 18L3 15.5"></path>
+  </symbol>
+  <symbol id="i-search" viewBox="0 0 24 24">
+    <circle cx="11" cy="11" r="7"></circle>
+    <path d="m20.5 20.5-4.2-4.2"></path>
+  </symbol>
+  <symbol id="i-sparkle" viewBox="0 0 24 24">
+    <path d="m12 3 1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9Z"></path>
+    <path d="M18.7 15.2l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8Z"></path>
+  </symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24">
+    <rect x="3" y="4" width="18" height="16" rx="2.5"></rect>
+    <path d="M15 4v16"></path>
+  </symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="3.1"></circle>
+    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.35.4.65.73.86"></path>
+  </symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24">
+    <path d="M3 6h18"></path>
+    <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"></path>
+    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+    <path d="M10 11v6M14 11v6"></path>
+  </symbol>
+  <symbol id="i-x" viewBox="0 0 24 24">
+    <path d="M18 6 6 18M6 6l12 12"></path>
+  </symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24">
+    <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2h7.5A2.5 2.5 0 0 1 21 9.5v7a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5Z"></path>
+  </symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24">
+    <path d="M10.3 4.2 2.9 17a2 2 0 0 0 1.7 3h14.8a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0Z"></path>
+    <path d="M12 9v4M12 17h.01"></path>
+  </symbol>
+  <symbol id="i-info" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="9"></circle>
+    <path d="M12 11v5M12 8h.01"></path>
+  </symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24">
+    <path d="M3 3v6h6"></path>
+    <path d="M3.5 9a9 9 0 1 0 2.1 9.4"></path>
+  </symbol>
+  <symbol id="i-check" viewBox="0 0 24 24">
+    <path d="M20 6 9 17l-5-5"></path>
+  </symbol>
+  <symbol id="i-check-square" viewBox="0 0 24 24">
+    <rect x="3.5" y="3.5" width="17" height="17" rx="3"></rect>
+    <path d="m8 12 3 3 5-6"></path>
+  </symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24">
+    <path d="m12 3 9 5-9 5-9-5Z"></path>
+    <path d="m3 12 9 5 9-5"></path>
+    <path d="m3 16 9 5 9-5"></path>
+  </symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24">
+    <rect x="4" y="10" width="16" height="10" rx="2.5"></rect>
+    <path d="M8 10V7a4 4 0 0 1 8 0v3"></path>
+  </symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24">
+    <path d="M12 3 5 5.8v5.7c0 4.4 3 7.6 7 9.5 4-1.9 7-5.1 7-9.5V5.8Z"></path>
+    <path d="m9 12 2 2 4-4.2"></path>
+  </symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24">
+    <path d="m6 9.5 6 6 6-6"></path>
+  </symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24">
+    <path d="m9.5 6 6 6-6 6"></path>
+  </symbol>
+  <symbol id="i-chevron-left" viewBox="0 0 24 24">
+    <path d="m14.5 6-6 6 6 6"></path>
+  </symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24">
+    <path d="M4 5h16l-6 7v6.5l-4 1.5v-8Z"></path>
+  </symbol>
+  <symbol id="i-rows" viewBox="0 0 24 24">
+    <path d="M4 6.5h16M4 12h16M4 17.5h16"></path>
+  </symbol>
+  <symbol id="i-more" viewBox="0 0 24 24">
+    <path d="M5 12h.01M12 12h.01M19 12h.01"></path>
+  </symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24">
+    <rect x="9" y="9" width="11" height="11" rx="2.5"></rect>
+    <path d="M5 15V6a2 2 0 0 1 2-2h9"></path>
+  </symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="8.5"></circle>
+    <path d="M12 7v5.2l3.2 2"></path>
+  </symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24">
+    <path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"></path>
+    <path d="M20.5 4v5h-5"></path>
+  </symbol>
+  <symbol id="i-external" viewBox="0 0 24 24">
+    <path d="M14 4h6v6"></path>
+    <path d="M20 4 11.5 12.5"></path>
+    <path d="M18 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"></path>
+  </symbol>
+  <symbol id="i-command" viewBox="0 0 24 24">
+    <path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"></path>
+  </symbol>
+  <symbol id="i-arrow-left-right" viewBox="0 0 24 24">
+    <path d="M8 3 4 7l4 4"></path>
+    <path d="M4 7h16"></path>
+    <path d="m16 21 4-4-4-4"></path>
+    <path d="M20 17H4"></path>
+  </symbol>
+  <symbol id="i-database" viewBox="0 0 24 24">
+    <ellipse cx="12" cy="6" rx="7" ry="3"></ellipse>
+    <path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"></path>
+    <path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"></path>
+  </symbol>
+  <symbol id="i-file" viewBox="0 0 24 24">
+    <path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9Z"></path>
+    <path d="M13 3v6h6"></path>
+  </symbol>
+</svg>
+
+<div class="prototype" id="prototype" data-density="comfortable">
+  <div class="proto-stage">
+    <div class="window" id="window">
+      <div class="window-titlebar">
+        <div class="traffic-lights" aria-hidden="true">
+          <span class="traffic-light is-close"></span>
+          <span class="traffic-light is-min"></span>
+          <span class="traffic-light is-max"></span>
+        </div>
+        <div class="window-title">AgentSweep</div>
+        <div class="window-titlebar-tail" aria-hidden="true"></div>
+      </div>
+
+      <div class="app" id="app" data-detail="open">
+        <header class="topbar">
+          <div class="topbar-brand">
+            <button class="brand" id="brandHome" type="button" title="回到全部会话">
+              <span class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4.4 15.8A8.2 8.2 0 0 1 18.9 7.2"></path>
+                  <path d="M4.4 15.8H9"></path>
+                  <path d="M4.4 15.8v-4.5"></path>
+                  <circle cx="14.1" cy="15.3" r="2.1" fill="currentColor" stroke="none"></circle>
+                </svg>
+              </span>
+              <span class="brand-name">AgentSweep</span>
+            </button>
+            <span id="demoBadge" class="badge badge-demo" hidden>演示数据</span>
+          </div>
+
+          <div class="topbar-search" role="search">
+            <div class="search">
+              <svg class="icon search-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+              <input id="searchInput" type="search" placeholder="搜索标题、路径或摘要" aria-label="搜索会话" autocomplete="off" spellcheck="false">
+              <kbd id="searchKbd" class="kbd search-kbd">⌘F</kbd>
+              <button id="searchClear" class="search-clear" type="button" aria-label="清除搜索" hidden>
+                <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="topbar-actions">
+            <button id="paletteBtn" class="btn btn-quiet palette-trigger" type="button" title="命令面板（⌘K）" aria-label="打开命令面板">
+              <svg class="icon" aria-hidden="true"><use href="#i-command"></use></svg>
+              <kbd class="kbd">⌘K</kbd>
+            </button>
+            <button id="discoverBtn" class="btn btn-quiet discover-trigger" type="button" title="查看发现的未收录目录（⌘⇧D）">
+              <svg class="icon" aria-hidden="true"><use href="#i-sparkle"></use></svg>
+              <span class="btn-label">发现</span>
+              <span id="discoverCount" class="count-badge">2</span>
+            </button>
+            <span class="topbar-sep" aria-hidden="true"></span>
+            <button id="detailToggle" class="icon-btn is-pressed" type="button" aria-pressed="true" aria-label="隐藏详情面板" title="显示或隐藏详情（⌘\）">
+              <svg class="icon" aria-hidden="true"><use href="#i-panel"></use></svg>
+            </button>
+            <button id="settingsBtn" class="icon-btn" type="button" aria-label="设置" title="设置（⌘,）">
+              <svg class="icon" aria-hidden="true"><use href="#i-gear"></use></svg>
+            </button>
+            <button id="scanIssuesBtn" class="icon-btn has-issues" type="button" aria-label="查看扫描问题" title="2 个 Agent 扫描失败" hidden>
+              <svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg>
+              <span class="icon-btn-dot" aria-hidden="true"></span>
+            </button>
+            <button id="scanBtn" class="btn btn-primary scan-btn" type="button" title="扫描本机所有 Agent 的会话（⌘R）">
+              <svg class="icon" aria-hidden="true"><use href="#i-scan"></use></svg>
+              <span id="scanBtnLabel">扫描</span>
+              <kbd id="scanKbd" class="kbd kbd-on-solid">⌘R</kbd>
+            </button>
+          </div>
+
+          <div id="scanProgress" class="scan-progress" role="progressbar" aria-label="扫描进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+            <span id="scanProgressBar" class="scan-progress-bar"></span>
+          </div>
+        </header>
+
+        <main class="workspace" id="workspace">
+          <aside class="sidebar" aria-label="Agent 列表">
+            <div class="sidebar-head">
+              <h2 class="sidebar-title">Agent</h2>
+              <span class="sidebar-total" id="agentTotal">8</span>
+              <button id="sidebarCollapse" class="icon-btn icon-btn-sm sidebar-collapse" type="button" aria-label="收起侧栏" title="收起侧栏" hidden>
+                <svg class="icon" aria-hidden="true"><use href="#i-chevron-left"></use></svg>
+              </button>
+            </div>
+
+            <nav id="agentList" class="agent-list" aria-label="按 Agent 筛选">
+              <button id="agentAll" class="agent-row agent-all is-active" type="button" data-agent="all" aria-pressed="true">
+                <span class="agent-icon agent-icon-all" aria-hidden="true">
+                  <svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg>
+                </span>
+                <span class="agent-name">全部会话</span>
+                <span class="agent-count" id="allCount">26</span>
+                <span class="agent-meta" id="allMeta">5.7 MB</span>
+              </button>
+
+              <div id="agentGroups" class="agent-groups" data-static-sample="true">
+                <div class="agent-group-label">命令行<span>3</span></div>
+                <button class="agent-row" type="button" data-agent="claude-code" aria-pressed="false">
+                  <span class="agent-icon" style="--agent-color:#C15F3C" aria-hidden="true"><span class="agent-initial">C</span></span>
+                  <span class="agent-name">Claude Code</span>
+                  <span class="agent-count">9</span>
+                  <span class="agent-meta">2.7 MB</span>
+                </button>
+                <button class="agent-row" type="button" data-agent="codex" aria-pressed="false">
+                  <span class="agent-icon" style="--agent-color:#2F3437" aria-hidden="true"><span class="agent-initial">O</span></span>
+                  <span class="agent-name">Codex</span>
+                  <span class="agent-count">3</span>
+                  <span class="agent-meta">100 KB</span>
+                </button>
+                <button class="agent-row" type="button" data-agent="gemini-cli" aria-pressed="false">
+                  <span class="agent-icon" style="--agent-color:#4285F4" aria-hidden="true"><span class="agent-initial">G</span></span>
+                  <span class="agent-name">Gemini CLI</span>
+                  <span class="agent-count">2</span>
+                  <span class="agent-meta">98 KB</span>
+                </button>
+
+                <div class="agent-group-label">IDEA / 编辑器<span>3</span></div>
+                <button class="agent-row" type="button" data-agent="cursor" aria-pressed="false">
+                  <span class="agent-icon" style="--agent-color:#2F3437" aria-hidden="true"><span class="agent-initial">Cu</span></span>
+                  <span class="agent-name">Cursor</span>
+                  <span class="agent-count">8</span>
+                  <span class="agent-meta">2.4 MB</span>
+                </button>
+                <button class="agent-row" type="button" data-agent="zed" aria-pressed="false">
+                  <span class="agent-icon" style="--agent-color:#3661EB" aria-hidden="true"><span class="agent-initial">Z</span></span>
+                  <span class="agent-name">Zed AI</span>
+                  <span class="agent-count">2</span>
+                  <span class="agent-meta">0 B</span>
+                </button>
+                <button class="agent-row" type="button" data-agent="trae" aria-pressed="false">
+                  <span class="agent-icon" style="--agent-color:#D93A5A" aria-hidden="true"><span class="agent-initial">T</span></span>
+                  <span class="agent-name">Trae</span>
+                  <span class="agent-count">1</span>
+                  <span class="agent-meta">60 KB</span>
+                </button>
+
+                <div class="agent-group-label">插件<span>1</span></div>
+                <button class="agent-row" type="button" data-agent="cline" aria-pressed="false">
+                  <span class="agent-icon" style="--agent-color:#5B5FC7" aria-hidden="true"><span class="agent-initial">Cl</span></span>
+                  <span class="agent-name">Cline</span>
+                  <span class="agent-count">1</span>
+                  <span class="agent-meta">81 KB</span>
+                </button>
+
+                <div class="agent-group-label">应用<span>1</span></div>
+                <button class="agent-row is-muted" type="button" data-agent="workbuddy" aria-pressed="false" title="没有检测到 WorkBuddy 的会话存储目录">
+                  <span class="agent-icon" style="--agent-color:#7A4DD8" aria-hidden="true"><span class="agent-initial">W</span></span>
+                  <span class="agent-name">WorkBuddy</span>
+                  <span class="agent-count agent-count-muted">未安装</span>
+                  <span class="agent-meta">发现页可查看</span>
+                </button>
+              </div>
+            </nav>
+
+            <div class="sidebar-foot">
+              <span class="sidebar-foot-note">只读本机 · 不联网</span>
+              <span id="versionLabel" class="sidebar-version">0.1.0</span>
+            </div>
+          </aside>
+
+          <section class="list-pane" aria-label="会话列表">
+            <div class="list-head">
+              <div class="list-heading">
+                <h1 id="listTitle" class="list-title">全部会话</h1>
+                <p id="listMeta" class="list-meta">26 条 · 5.7 MB</p>
+              </div>
+              <div class="list-tools">
+                <button id="filterBtn" class="btn btn-quiet btn-tool" type="button" aria-haspopup="true" aria-expanded="false" title="筛选会话">
+                  <svg class="icon" aria-hidden="true"><use href="#i-filter"></use></svg>
+                  <span class="btn-label">筛选</span>
+                  <span id="filterCount" class="count-badge" hidden>0</span>
+                  <svg class="icon icon-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                </button>
+                <button id="quickSelectBtn" class="btn btn-quiet btn-tool" type="button" aria-haspopup="true" aria-expanded="false" title="快速选择">
+                  <svg class="icon" aria-hidden="true"><use href="#i-check-square"></use></svg>
+                  <span class="btn-label">快速选择</span>
+                  <svg class="icon icon-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                </button>
+                <button id="densityBtn" class="icon-btn" type="button" aria-pressed="false" aria-label="切换紧凑密度" title="紧凑密度">
+                  <svg class="icon" aria-hidden="true"><use href="#i-rows"></use></svg>
+                </button>
+              </div>
+            </div>
+
+            <div id="filterChips" class="filter-chips" data-static-sample="true" hidden>
+              <span class="filter-chip"><span class="filter-chip-label">文件</span><button class="filter-chip-x" type="button" aria-label="移除筛选：文件"><svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg></button></span>
+              <span class="filter-chip"><span class="filter-chip-label">7 天内</span><button class="filter-chip-x" type="button" aria-label="移除筛选：7 天内"><svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg></button></span>
+            </div>
+
+            <div id="issueBanner" class="issue-banner" hidden>
+              <div class="issue-banner-main">
+                <svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg>
+                <span id="issueBannerText" class="issue-banner-text">2 个 Agent 扫描失败</span>
+                <button id="issueBannerBtn" class="btn-link" type="button">查看</button>
+              </div>
+              <div id="issueList" class="issue-list" data-static-sample="true" hidden>
+                <div class="issue-row"><span class="issue-agent">Claude Code</span><span class="issue-msg">读取 history.jsonl 时权限不足</span><button class="issue-retry" type="button">重试</button></div>
+                <div class="issue-row"><span class="issue-agent">Cursor</span><span class="issue-msg">state.vscdb 被另一个进程占用</span><button class="issue-retry" type="button">重试</button></div>
+              </div>
+            </div>
+
+            <div class="table-wrap" id="tableWrap">
+              <table class="session-table" id="sessionTable">
+                <caption class="sr-only">会话列表，可勾选后清理</caption>
+                <colgroup>
+                  <col class="col-check">
+                  <col class="col-title">
+                  <col class="col-project">
+                  <col class="col-messages">
+                  <col class="col-size">
+                  <col class="col-time">
+                  <col class="col-actions">
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th scope="col" class="cell-check">
+                      <input id="selectAll" type="checkbox" aria-label="全选当前列表">
+                    </th>
+                    <th scope="col" class="cell-title" aria-sort="none">
+                      <button class="sort-btn" type="button" data-sort="title">标题<span class="sort-caret" aria-hidden="true"></span></button>
+                    </th>
+                    <th scope="col" class="cell-project"><span class="col-label">项目</span></th>
+                    <th scope="col" class="cell-num col-messages" aria-sort="none">
+                      <button class="sort-btn" type="button" data-sort="messages">消息<span class="sort-caret" aria-hidden="true"></span></button>
+                    </th>
+                    <th scope="col" class="cell-num col-size" aria-sort="none">
+                      <button class="sort-btn" type="button" data-sort="bytes">体积<span class="sort-caret" aria-hidden="true"></span></button>
+                    </th>
+                    <th scope="col" class="cell-time" aria-sort="descending">
+                      <button class="sort-btn" type="button" data-sort="updatedAt">更新时间<span class="sort-caret" aria-hidden="true"></span></button>
+                    </th>
+                    <th scope="col" class="cell-actions"><span class="sr-only">更多操作</span></th>
+                  </tr>
+                </thead>
+
+                <tbody id="sessionBody" data-static-sample="true">
+                  <tr class="session-row is-focused" data-uid="claude-code:c1" tabindex="0" aria-selected="false" data-active="true">
+                    <td class="cell-check"><input type="checkbox" class="row-check" aria-label="选择会话：重构 catalog registry 的加载顺序"></td>
+                    <td class="cell-title">
+                      <div class="row-title-line">
+                        <span class="row-agent-icon agent-icon is-sm" style="--agent-color:#C15F3C" aria-hidden="true"><span class="agent-initial">C</span></span>
+                        <span class="row-title">重构 catalog registry 的加载顺序</span>
+                        <span class="badge badge-warn">可能正在使用</span>
+                      </div>
+                      <div class="row-snippet">把 Spec 的解析从 switch 改成表驱动，顺便补上 roots 的候选顺序测试…</div>
+                    </td>
+                    <td class="cell-project"><span class="path-text">~/Projects/agent-sweep</span></td>
+                    <td class="cell-num">42</td>
+                    <td class="cell-num cell-size">180 KB</td>
+                    <td class="cell-time">今天 19:37</td>
+                    <td class="cell-actions"><button class="row-more" type="button" aria-label="更多操作"><svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr class="session-row" data-uid="cursor:cu1" tabindex="-1" aria-selected="false" data-active="false">
+                    <td class="cell-check"><input type="checkbox" class="row-check" aria-label="选择会话：会话列表滚动卡顿的定位"></td>
+                    <td class="cell-title">
+                      <div class="row-title-line">
+                        <span class="row-agent-icon agent-icon is-sm" style="--agent-color:#2F3437" aria-hidden="true"><span class="agent-initial">Cu</span></span>
+                        <span class="row-title">会话列表滚动卡顿的定位</span>
+                      </div>
+                      <div class="row-snippet">每次选中都重建整张表，滚动容器的高度被反复重置。</div>
+                    </td>
+                    <td class="cell-project"><span class="path-text">~/Projects/harness-web</span></td>
+                    <td class="cell-num">63</td>
+                    <td class="cell-num cell-size">1.5 MB</td>
+                    <td class="cell-time">今天 19:10</td>
+                    <td class="cell-actions"><button class="row-more" type="button" aria-label="更多操作"><svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr class="session-row" data-uid="codex:x1" tabindex="-1" aria-selected="false" data-active="false">
+                    <td class="cell-check"><input type="checkbox" class="row-check" aria-label="选择会话：把超时策略从全局改成按请求"></td>
+                    <td class="cell-title">
+                      <div class="row-title-line">
+                        <span class="row-agent-icon agent-icon is-sm" style="--agent-color:#2F3437" aria-hidden="true"><span class="agent-initial">O</span></span>
+                        <span class="row-title">把超时策略从全局改成按请求</span>
+                      </div>
+                      <div class="row-snippet">每个请求单独算 deadline，慢请求不要连带取消其它请求。</div>
+                    </td>
+                    <td class="cell-project"><span class="path-text">~/Projects/harness-web</span></td>
+                    <td class="cell-num">17</td>
+                    <td class="cell-num cell-size">54 KB</td>
+                    <td class="cell-time">今天 17:29</td>
+                    <td class="cell-actions"><button class="row-more" type="button" aria-label="更多操作"><svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr class="session-row" data-uid="claude-code:c2" tabindex="-1" aria-selected="false" data-active="false">
+                    <td class="cell-check"><input type="checkbox" class="row-check" aria-label="选择会话：排查 SQLite 删行后的 FTS 残留"></td>
+                    <td class="cell-title">
+                      <div class="row-title-line">
+                        <span class="row-agent-icon agent-icon is-sm" style="--agent-color:#C15F3C" aria-hidden="true"><span class="agent-initial">C</span></span>
+                        <span class="row-title">排查 SQLite 删行后的 FTS 残留</span>
+                      </div>
+                      <div class="row-snippet">VACUUM 之前先重建 FTS 索引，否则搜索还是会命中空会话。</div>
+                    </td>
+                    <td class="cell-project"><span class="path-text">~/Projects/agent-sweep</span></td>
+                    <td class="cell-num">28</td>
+                    <td class="cell-num cell-size">94 KB</td>
+                    <td class="cell-time">今天 16:43</td>
+                    <td class="cell-actions"><button class="row-more" type="button" aria-label="更多操作"><svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr class="session-row" data-uid="gemini-cli:g1" tabindex="-1" aria-selected="false" data-active="false">
+                    <td class="cell-check"><input type="checkbox" class="row-check" aria-label="选择会话：整理项目里散落的 README"></td>
+                    <td class="cell-title">
+                      <div class="row-title-line">
+                        <span class="row-agent-icon agent-icon is-sm" style="--agent-color:#4285F4" aria-hidden="true"><span class="agent-initial">G</span></span>
+                        <span class="row-title">整理项目里散落的 README</span>
+                      </div>
+                      <div class="row-snippet">把 installation、development、deploy 三块拆开，主文件只留入口。</div>
+                    </td>
+                    <td class="cell-project"><span class="path-text">~/Projects/harness-web</span></td>
+                    <td class="cell-num">20</td>
+                    <td class="cell-num cell-size">70 KB</td>
+                    <td class="cell-time">今天 15:00</td>
+                    <td class="cell-actions"><button class="row-more" type="button" aria-label="更多操作"><svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr class="session-row" data-uid="cursor:cu2" tabindex="-1" aria-selected="false" data-active="false">
+                    <td class="cell-check"><input type="checkbox" class="row-check" aria-label="选择会话：Cursor 的 state.vscdb 索引结构"></td>
+                    <td class="cell-title">
+                      <div class="row-title-line">
+                        <span class="row-agent-icon agent-icon is-sm" style="--agent-color:#2F3437" aria-hidden="true"><span class="agent-initial">Cu</span></span>
+                        <span class="row-title">Cursor 的 state.vscdb 索引结构</span>
+                        <span class="badge badge-neutral">SQLite 行</span>
+                      </div>
+                      <div class="row-snippet">SQLite 行 · 正文在数据库中，索引库会整库备份。</div>
+                    </td>
+                    <td class="cell-project"><span class="path-text">~/Projects/agent-sweep</span></td>
+                    <td class="cell-num">37</td>
+                    <td class="cell-num cell-size">240 KB</td>
+                    <td class="cell-time">今天 14:47</td>
+                    <td class="cell-actions"><button class="row-more" type="button" aria-label="更多操作"><svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr class="session-row" data-uid="zed:z1" tabindex="-1" aria-selected="false" data-active="false">
+                    <td class="cell-check"><input type="checkbox" class="row-check" aria-label="选择会话：Zed 的 thread 数据结构"></td>
+                    <td class="cell-title">
+                      <div class="row-title-line">
+                        <span class="row-agent-icon agent-icon is-sm" style="--agent-color:#3661EB" aria-hidden="true"><span class="agent-initial">Z</span></span>
+                        <span class="row-title">Zed 的 thread 数据结构</span>
+                        <span class="badge badge-neutral">SQLite 行</span>
+                      </div>
+                      <div class="row-snippet">threads.db 里一条线程对应一行，正文是 data 列的 BLOB。</div>
+                    </td>
+                    <td class="cell-project"><span class="path-text">~/Projects/agent-sweep</span></td>
+                    <td class="cell-num">0</td>
+                    <td class="cell-num cell-size">0 B</td>
+                    <td class="cell-time">今天 12:55</td>
+                    <td class="cell-actions"><button class="row-more" type="button" aria-label="更多操作"><svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                  <tr class="session-row" data-uid="codex:x2" tabindex="-1" aria-selected="false" data-active="false">
+                    <td class="cell-check"><input type="checkbox" class="row-check" aria-label="选择会话：给 CLI 加一个 --dry-run"></td>
+                    <td class="cell-title">
+                      <div class="row-title-line">
+                        <span class="row-agent-icon agent-icon is-sm" style="--agent-color:#2F3437" aria-hidden="true"><span class="agent-initial">O</span></span>
+                        <span class="row-title">给 CLI 加一个 --dry-run</span>
+                      </div>
+                      <div class="row-snippet">只打印会删哪些文件，不真的移动；和 --json 可以叠加。</div>
+                    </td>
+                    <td class="cell-project"><span class="path-text">~/Projects/agent-sweep</span></td>
+                    <td class="cell-num">12</td>
+                    <td class="cell-num cell-size">38 KB</td>
+                    <td class="cell-time">昨天 21:55</td>
+                    <td class="cell-actions"><button class="row-more" type="button" aria-label="更多操作"><svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg></button></td>
+                  </tr>
+                </tbody>
+              </table>
+
+              <div id="emptyState" class="empty-state" hidden>
+                <span class="empty-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg></span>
+                <h3 id="emptyTitle" class="empty-title">还没有找到会话</h3>
+                <p id="emptyDesc" class="empty-desc">扫描只会读取文件，不会修改任何内容。</p>
+                <button id="emptyAction" class="btn btn-primary" type="button">
+                  <svg class="icon" aria-hidden="true"><use href="#i-scan"></use></svg>
+                  扫描本机
+                </button>
+              </div>
+
+              <div id="skeleton" class="skeleton" hidden aria-hidden="true">
+                <div class="skeleton-row"><span class="sk sk-check"></span><span class="sk sk-title"></span><span class="sk sk-project"></span><span class="sk sk-num"></span><span class="sk sk-size"></span><span class="sk sk-time"></span></div>
+                <div class="skeleton-row"><span class="sk sk-check"></span><span class="sk sk-title"></span><span class="sk sk-project"></span><span class="sk sk-num"></span><span class="sk sk-size"></span><span class="sk sk-time"></span></div>
+                <div class="skeleton-row"><span class="sk sk-check"></span><span class="sk sk-title"></span><span class="sk sk-project"></span><span class="sk sk-num"></span><span class="sk sk-size"></span><span class="sk sk-time"></span></div>
+                <div class="skeleton-row"><span class="sk sk-check"></span><span class="sk sk-title"></span><span class="sk sk-project"></span><span class="sk sk-num"></span><span class="sk sk-size"></span><span class="sk sk-time"></span></div>
+                <div class="skeleton-row"><span class="sk sk-check"></span><span class="sk sk-title"></span><span class="sk sk-project"></span><span class="sk sk-num"></span><span class="sk sk-size"></span><span class="sk sk-time"></span></div>
+                <div class="skeleton-row"><span class="sk sk-check"></span><span class="sk sk-title"></span><span class="sk sk-project"></span><span class="sk sk-num"></span><span class="sk sk-size"></span><span class="sk sk-time"></span></div>
+              </div>
+            </div>
+          </section>
+
+          <aside id="detailPane" class="detail-pane" aria-label="会话详情">
+            <header class="detail-head">
+              <h2 id="detailTitle" class="detail-head-title">详情</h2>
+              <button id="detailClose" class="icon-btn icon-btn-sm" type="button" aria-label="关闭详情" title="关闭详情（⌘\）">
+                <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+              </button>
+            </header>
+
+            <div id="detailBody" class="detail-body" data-static-sample="true">
+              <div class="detail-identity">
+                <span class="agent-icon is-lg" style="--agent-color:#C15F3C" aria-hidden="true"><span class="agent-initial">C</span></span>
+                <span class="detail-identity-copy">
+                  <span class="detail-agent-name">Claude Code</span>
+                  <span class="detail-vendor">Anthropic</span>
+                </span>
+                <span class="badge badge-storage"><svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg>文件</span>
+              </div>
+
+              <h3 class="detail-title">重构 catalog registry 的加载顺序</h3>
+              <p class="detail-meta"><span>今天 19:37</span><span class="dot-divider" aria-hidden="true"></span><span>42 条消息</span></p>
+
+              <div class="detail-badges">
+                <span class="badge badge-warn"><svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg>可能正在使用</span>
+                <span class="badge badge-neutral">文件</span>
+              </div>
+
+              <div class="callout callout-warn">
+                <svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg>
+                <div class="callout-copy">
+                  <strong>Claude Code 可能正在写入这条会话。</strong>
+                  <span>建议先退出 Claude Code；继续清理可能丢失尚未落盘的内容。</span>
+                </div>
+              </div>
+
+              <div class="detail-stats">
+                <div class="stat"><span class="stat-label">体积</span><span class="stat-value">180 KB</span></div>
+                <div class="stat"><span class="stat-label">消息</span><span class="stat-value">42</span></div>
+                <div class="stat"><span class="stat-label">最后更新</span><span class="stat-value">今天 19:37</span></div>
+              </div>
+
+              <section class="detail-section">
+                <div class="detail-section-head">
+                  <h4 class="detail-section-title">文件位置</h4>
+                  <span class="detail-section-note">1 个文件</span>
+                </div>
+                <ul class="path-list">
+                  <li class="path-row">
+                    <span class="path-text" title="/Users/x/.claude/projects/-Users-x-Projects-agent-sweep/9f2c1d.jsonl">~/.claude/projects/-Users-x-Projects-agent-sweep/9f2c1d.jsonl</span>
+                    <span class="path-actions">
+                      <button class="icon-btn icon-btn-xs" type="button" aria-label="复制路径" title="复制路径"><svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg></button>
+                      <button class="icon-btn icon-btn-xs" type="button" aria-label="在 Finder 中显示" title="在 Finder 中显示"><svg class="icon" aria-hidden="true"><use href="#i-external"></use></svg></button>
+                    </span>
+                  </li>
+                </ul>
+                <p class="detail-section-hint">索引位置：<span class="path-text">~/.claude/history.jsonl</span>、<span class="path-text">~/.claude/sessions-index.json</span></p>
+              </section>
+
+              <section class="detail-section">
+                <div class="detail-section-head">
+                  <h4 class="detail-section-title">清理影响</h4>
+                  <span class="detail-section-note">可撤销</span>
+                </div>
+                <div class="impact-list">
+                  <div class="impact-row"><span class="impact-label">正文去向</span><span class="impact-value">移入废纸篓</span></div>
+                  <div class="impact-row"><span class="impact-label">索引处理</span><span class="impact-value">裁剪 history 与 sessions-index</span></div>
+                  <div class="impact-row"><span class="impact-label">撤销窗口</span><span class="impact-value">24 小时内</span></div>
+                  <div class="impact-row"><span class="impact-label">真实释放</span><span class="impact-value">0 B · 清空废纸篓后生效</span></div>
+                </div>
+              </section>
+
+              <details class="detail-note">
+                <summary>关于 Claude Code 的清理说明</summary>
+                <p>删除会同步裁剪 history.jsonl 与 sessions-index.json，否则 Agent 里会留下点进去是空的幽灵会话。索引会先备份到 Application Support/AgentSweep/backups/。</p>
+              </details>
+            </div>
+
+            <footer id="detailFoot" class="detail-foot">
+              <button id="detailReveal" class="btn btn-secondary detail-foot-secondary" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg>
+                <span>在 Finder 中显示</span>
+              </button>
+              <button id="detailSelect" class="btn btn-primary detail-foot-primary" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>
+                <span>选中此会话</span>
+              </button>
+            </footer>
+          </aside>
+        </main>
+
+        <footer class="statusbar">
+          <div id="scanStatus" class="scan-status" role="status" aria-live="polite">
+            <span class="status-dot is-done" aria-hidden="true"></span>
+            <span class="status-text">扫描完成 · 26 条会话 · 5.7 MB</span>
+          </div>
+
+          <div class="status-actions">
+            <button id="undoChip" class="undo-chip" type="button" title="撤销最近一次清理">
+              <svg class="icon" aria-hidden="true"><use href="#i-undo"></use></svg>
+              <span class="undo-chip-text">已移入废纸篓 4 条</span>
+              <span class="undo-chip-action">撤销</span>
+            </button>
+
+            <div id="selectionSummary" class="selection-summary" aria-live="polite">
+              <span class="selection-line">已选 <b>0</b> 条 · <b>0 B</b></span>
+              <span class="selection-ledger">真实释放 <b>0 B</b></span>
+            </div>
+
+            <button id="cleanBtn" class="btn btn-clean" type="button" aria-disabled="true" disabled title="选择会话后可清理">
+              <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
+              <span id="cleanBtnLabel">清理</span>
+            </button>
+          </div>
+        </footer>
+
+        <div id="scrim" class="scrim" hidden></div>
+
+        <aside id="settingsSheet" class="sheet sheet-settings" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" tabindex="-1" hidden>
+          <header class="sheet-head">
+            <div class="sheet-heading">
+              <h2 id="settingsTitle" class="sheet-title">设置</h2>
+              <p class="sheet-sub">更改会立即生效并保存在本机</p>
+            </div>
+            <button id="closeSettings" class="icon-btn sheet-close" type="button" aria-label="关闭设置" data-close-sheet="settings">
+              <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+            </button>
+          </header>
+
+          <div class="sheet-body">
+            <section class="sheet-section">
+              <h3 class="section-label">清理方式</h3>
+              <div class="segmented segmented-wide" role="radiogroup" aria-label="清理方式">
+                <label class="seg">
+                  <input type="radio" name="deleteMode" value="trash" checked>
+                  <span class="seg-label">移入废纸篓</span>
+                </label>
+                <label class="seg">
+                  <input type="radio" name="deleteMode" value="permanent">
+                  <span class="seg-label">永久删除</span>
+                </label>
+              </div>
+              <p class="field-hint" id="deleteModeHint">正文进入废纸篓，可撤销；真实释放会在清空废纸篓后生效。</p>
+            </section>
+
+            <section class="sheet-section">
+              <h3 class="section-label">行为</h3>
+              <div class="pref-list">
+                <label class="pref-row">
+                  <span class="pref-copy">
+                    <span class="pref-title">清理前显示确认</span>
+                    <span class="pref-desc">列出条数、体积和会受影响的 Agent</span>
+                  </span>
+                  <input id="prefConfirm" class="switch" type="checkbox" checked>
+                </label>
+                <label class="pref-row">
+                  <span class="pref-copy">
+                    <span class="pref-title">包含快照</span>
+                    <span class="pref-desc">把会话旁挂的快照文件也计入扫描结果</span>
+                  </span>
+                  <input id="prefSnapshots" class="switch" type="checkbox" checked>
+                </label>
+                <label class="pref-row">
+                  <span class="pref-copy">
+                    <span class="pref-title">启动时自动扫描</span>
+                    <span class="pref-desc">打开 AgentSweep 后自动读取一次</span>
+                  </span>
+                  <input id="prefAutoScan" class="switch" type="checkbox" checked>
+                </label>
+              </div>
+            </section>
+
+            <section class="sheet-section">
+              <h3 class="section-label">外观</h3>
+              <div class="segmented segmented-wide" role="radiogroup" aria-label="外观">
+                <label class="seg">
+                  <input type="radio" name="appearance" value="auto" checked>
+                  <span class="seg-label">自动</span>
+                </label>
+                <label class="seg">
+                  <input type="radio" name="appearance" value="light">
+                  <span class="seg-label">浅色</span>
+                </label>
+                <label class="seg">
+                  <input type="radio" name="appearance" value="dark">
+                  <span class="seg-label">深色</span>
+                </label>
+              </div>
+              <p class="field-hint">「自动」跟随 macOS 外观设置。</p>
+            </section>
+
+            <section class="sheet-section">
+              <div class="section-head">
+                <h3 class="section-label">最近清理</h3>
+                <span class="section-note">24 小时内可撤销</span>
+              </div>
+              <div id="batchList" class="batch-list" data-static-sample="true">
+                <div class="batch-row">
+                  <div class="batch-copy">
+                    <span class="batch-title">今天 16:37 · 4 条</span>
+                    <span class="batch-meta">移入废纸篓 · 真实释放 0 B · Claude Code、Cursor</span>
+                  </div>
+                  <button class="btn btn-quiet btn-xs batch-undo" type="button">撤销</button>
+                </div>
+                <div class="batch-row">
+                  <div class="batch-copy">
+                    <span class="batch-title">10月15日 13:15 · 2 条</span>
+                    <span class="batch-meta">永久删除 · 真实释放 1.5 MB · Cursor</span>
+                  </div>
+                  <span class="batch-tag">不可撤销</span>
+                </div>
+                <div class="batch-row">
+                  <div class="batch-copy">
+                    <span class="batch-title">10月12日 11:15 · 7 条</span>
+                    <span class="batch-meta">移入废纸篓 · 真实释放 0 B · Codex、Claude Code、Gemini CLI</span>
+                  </div>
+                  <span class="batch-tag">已过期</span>
+                </div>
+              </div>
+              <div class="backup-row">
+                <span class="backup-path path-text">~/Library/Application Support/AgentSweep/backups/</span>
+                <button id="openBackupsBtn" class="btn btn-secondary btn-xs" type="button">
+                  <svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg>
+                  打开目录
+                </button>
+              </div>
+            </section>
+          </div>
+
+          <footer class="sheet-privacy">
+            <span class="privacy-line"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>所有数据都留在本机 · 不联网</span>
+            <span id="settingsVersion" class="version-tag">AgentSweep 0.1.0</span>
+          </footer>
+        </aside>
+
+        <aside id="discoverSheet" class="sheet sheet-wide sheet-discover" role="dialog" aria-modal="true" aria-labelledby="discoverTitle" tabindex="-1" hidden>
+          <header class="sheet-head">
+            <div class="sheet-heading">
+              <h2 id="discoverTitle" class="sheet-title">发现</h2>
+              <p id="discoverSub" class="sheet-sub">2 个看起来像会话存储的目录</p>
+            </div>
+            <button class="icon-btn sheet-close" type="button" aria-label="关闭发现面板" data-close-sheet="discover">
+              <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+            </button>
+          </header>
+
+          <div class="sheet-body">
+            <p class="sheet-lede">这些目录有会话特征，但还没有收录。收录只写入适配器配置，不会移动或删除任何文件。</p>
+
+            <div id="discoverList" class="discover-list" data-static-sample="true">
+              <article class="candidate-card">
+                <div class="candidate-head">
+                  <div class="candidate-id">
+                    <span class="candidate-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-sparkle"></use></svg></span>
+                    <div class="candidate-copy">
+                      <h3 class="candidate-name">Warp Agent</h3>
+                      <p class="candidate-path path-text">~/Library/Application Support/Warp/agent-sessions</p>
+                    </div>
+                  </div>
+                  <button class="btn btn-secondary btn-sm candidate-adopt" type="button" data-adopt="warp-agent">收录为 Agent</button>
+                </div>
+                <div class="candidate-metrics">
+                  <div class="confidence">
+                    <span class="confidence-label">置信度</span>
+                    <span class="confidence-bar"><span class="confidence-fill" style="width:82%"></span></span>
+                    <span class="confidence-value">82%</span>
+                  </div>
+                  <span class="candidate-count">6 条 · 3.4 MB</span>
+                </div>
+                <div class="evidence-chips">
+                  <span class="evidence-chip">目录名含 sessions</span>
+                  <span class="evidence-chip">6 个会话子目录里有 conversation.json</span>
+                  <span class="evidence-chip">最近 7 天有写入</span>
+                </div>
+              </article>
+
+              <article class="candidate-card">
+                <div class="candidate-head">
+                  <div class="candidate-id">
+                    <span class="candidate-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-sparkle"></use></svg></span>
+                    <div class="candidate-copy">
+                      <h3 class="candidate-name">Muse</h3>
+                      <p class="candidate-path path-text">~/.muse/sessions</p>
+                    </div>
+                  </div>
+                  <button class="btn btn-secondary btn-sm candidate-adopt" type="button" data-adopt="muse">收录为 Agent</button>
+                </div>
+                <div class="candidate-metrics">
+                  <div class="confidence">
+                    <span class="confidence-label">置信度</span>
+                    <span class="confidence-bar"><span class="confidence-fill" style="width:64%"></span></span>
+                    <span class="confidence-value">64%</span>
+                  </div>
+                  <span class="candidate-count">3 条 · 900 KB</span>
+                </div>
+                <div class="evidence-chips">
+                  <span class="evidence-chip">3 个 .jsonl 文件</span>
+                  <span class="evidence-chip">文件头部含 role / createdAt 字段</span>
+                  <span class="evidence-chip">目录不在内置目录中</span>
+                </div>
+              </article>
+            </div>
+
+            <div class="discover-actions">
+              <button id="rediscoverBtn" class="btn btn-secondary" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                重新发现
+              </button>
+              <span class="field-hint">收录后可随时移除</span>
+            </div>
+          </div>
+
+          <footer class="sheet-privacy">
+            <span class="privacy-line"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>写入 ~/Library/Application Support/AgentSweep/adapters.json</span>
+            <span class="version-tag">不移动、不删除文件</span>
+          </footer>
+        </aside>
+
+        <div id="reviewDialog" class="dialog review-dialog" role="dialog" aria-modal="true" aria-labelledby="reviewTitle" tabindex="-1" hidden>
+          <header class="dialog-head">
+            <div class="dialog-heading">
+              <h2 id="reviewTitle" class="dialog-title">清理 3 条会话？</h2>
+              <p id="reviewLede" class="dialog-lede">索引会先备份，正文移入废纸篓后不会立即释放空间。</p>
+            </div>
+            <button class="icon-btn dialog-close" type="button" aria-label="关闭清理确认" data-close-dialog="review">
+              <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+            </button>
+          </header>
+
+          <div class="review-block">
+            <span class="field-label">涉及 Agent</span>
+            <div id="reviewAgents" class="agent-chips review-agent-list" data-static-sample="true">
+              <span class="agent-chip"><span class="agent-icon is-xs" style="--agent-color:#C15F3C" aria-hidden="true"><span class="agent-initial">C</span></span><span class="agent-chip-name">Claude Code</span><span class="agent-chip-meta">2 条 · 276 KB</span></span>
+              <span class="agent-chip"><span class="agent-icon is-xs" style="--agent-color:#2F3437" aria-hidden="true"><span class="agent-initial">O</span></span><span class="agent-chip-name">Codex</span><span class="agent-chip-meta">1 条 · 54 KB</span></span>
+            </div>
+          </div>
+
+          <div id="reviewLedger" class="ledger review-ledger" data-static-sample="true">
+            <div class="ledger-row">
+              <span class="ledger-label">会话正文</span>
+              <span class="ledger-value">331 KB</span>
+              <span class="ledger-note">移入废纸篓 · 不释放</span>
+            </div>
+            <div class="ledger-row">
+              <span class="ledger-label">索引备份</span>
+              <span class="ledger-value">已备份</span>
+              <span class="ledger-note">保留在应用支持目录</span>
+            </div>
+            <div class="ledger-row">
+              <span class="ledger-label">真实释放</span>
+              <span class="ledger-value">0 B</span>
+              <span class="ledger-note">清空废纸篓后生效</span>
+            </div>
+            <div class="ledger-total">
+              <span class="ledger-label">总计</span>
+              <span class="ledger-value">331 KB</span>
+              <span class="ledger-note">真实释放 0 B</span>
+            </div>
+          </div>
+
+          <div id="reviewActive" class="callout callout-warn">
+            <svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg>
+            <div class="callout-copy">
+              <strong>有 1 条会话可能正在使用。</strong>
+              <span>Claude Code 正在写入其中一条会话。建议先退出 Claude Code；继续清理可能丢失未落盘的内容。</span>
+            </div>
+          </div>
+
+          <div class="review-mode">
+            <span class="field-label">清理方式</span>
+            <div id="reviewModeSeg" class="segmented" role="radiogroup" aria-label="清理方式">
+              <label class="seg">
+                <input type="radio" name="reviewMode" value="trash" checked>
+                <span class="seg-label">移入废纸篓</span>
+              </label>
+              <label class="seg">
+                <input type="radio" name="reviewMode" value="permanent">
+                <span class="seg-label">永久删除</span>
+              </label>
+            </div>
+          </div>
+
+          <div id="reviewPermanentWarn" class="callout callout-danger" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg>
+            <div class="callout-copy">
+              <strong>永久删除不会进入废纸篓。</strong>
+              <span>清理后会话正文无法恢复；索引备份仍保留在应用支持目录。</span>
+            </div>
+          </div>
+
+          <label id="reviewAckRow" class="ack-row" hidden>
+            <input id="reviewAck" class="checkbox" type="checkbox">
+            <span>我明白永久删除无法恢复，也不会进入废纸篓。</span>
+          </label>
+
+          <p id="reviewError" class="dialog-error" role="alert" hidden>有 2 条会话未能清理，可以重试或先退出对应 Agent。</p>
+
+          <footer class="dialog-actions">
+            <button id="reviewCancel" class="btn btn-secondary" type="button">取消</button>
+            <button id="reviewConfirm" class="btn btn-primary" type="button">移入废纸篓 · 3 条</button>
+          </footer>
+        </div>
+
+        <div id="shortcutsDialog" class="dialog shortcuts-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle" tabindex="-1" hidden>
+          <header class="dialog-head">
+            <div class="dialog-heading">
+              <h2 id="shortcutsTitle" class="dialog-title">键盘快捷键</h2>
+              <p class="dialog-lede">常用操作都可以只用键盘完成。</p>
+            </div>
+            <button class="icon-btn dialog-close" type="button" aria-label="关闭快捷键" data-close-dialog="shortcuts">
+              <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+            </button>
+          </header>
+
+          <div id="shortcutsList" class="shortcuts-list">
+            <section class="shortcut-group">
+              <h3 class="shortcut-group-title">通用</h3>
+              <div class="shortcut-row"><span>命令面板</span><kbd class="kbd">⌘K</kbd></div>
+              <div class="shortcut-row"><span>聚焦搜索</span><kbd class="kbd">⌘F</kbd></div>
+              <div class="shortcut-row"><span>扫描</span><kbd class="kbd">⌘R</kbd></div>
+              <div class="shortcut-row"><span>设置</span><kbd class="kbd">⌘,</kbd></div>
+              <div class="shortcut-row"><span>发现</span><kbd class="kbd">⌘⇧D</kbd></div>
+              <div class="shortcut-row"><span>切换详情</span><kbd class="kbd">⌘\</kbd></div>
+              <div class="shortcut-row"><span>撤销最近清理</span><kbd class="kbd">⌘Z</kbd></div>
+              <div class="shortcut-row"><span>快捷键表</span><kbd class="kbd">?</kbd></div>
+              <div class="shortcut-row"><span>关闭浮层 / 清空搜索 / 清空选择</span><kbd class="kbd">Esc</kbd></div>
+            </section>
+            <section class="shortcut-group">
+              <h3 class="shortcut-group-title">列表</h3>
+              <div class="shortcut-row"><span>移动焦点</span><span class="kbd-pair"><kbd class="kbd">↑</kbd><kbd class="kbd">↓</kbd><span class="kbd-or">或</span><kbd class="kbd">J</kbd><kbd class="kbd">K</kbd></span></div>
+              <div class="shortcut-row"><span>切换选中</span><span class="kbd-pair"><kbd class="kbd">Space</kbd><span class="kbd-or">或</span><kbd class="kbd">X</kbd></span></div>
+              <div class="shortcut-row"><span>范围选择</span><span class="kbd-pair"><kbd class="kbd">Shift</kbd><kbd class="kbd">Space</kbd></span></div>
+              <div class="shortcut-row"><span>全选当前列表</span><kbd class="kbd">⌘A</kbd></div>
+              <div class="shortcut-row"><span>查看详情</span><kbd class="kbd">Enter</kbd></div>
+              <div class="shortcut-row"><span>清理选中</span><span class="kbd-pair"><kbd class="kbd">⌘</kbd><kbd class="kbd">⌫</kbd></span></div>
+            </section>
+          </div>
+
+          <footer class="dialog-actions">
+            <button class="btn btn-secondary" type="button" data-close-dialog="shortcuts">完成</button>
+          </footer>
+        </div>
+
+        <div id="palette" class="palette" role="dialog" aria-modal="true" aria-label="命令面板" tabindex="-1" hidden>
+          <div class="palette-input-row">
+            <svg class="icon palette-lead-icon" aria-hidden="true"><use href="#i-command"></use></svg>
+            <input id="paletteInput" type="text" placeholder="搜索会话或输入命令…" aria-label="搜索会话或输入命令" autocomplete="off" spellcheck="false">
+            <kbd class="kbd">esc</kbd>
+          </div>
+
+          <div id="paletteResults" class="palette-results" data-static-sample="true">
+            <div class="palette-group">
+              <div class="palette-group-title">会话</div>
+              <button class="palette-row is-active" type="button" data-uid="claude-code:c1">
+                <span class="palette-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg></span>
+                <span class="palette-label">重构 catalog registry 的加载顺序</span>
+                <span class="palette-meta">Claude Code · 今天 19:37</span>
+              </button>
+              <button class="palette-row" type="button" data-uid="cursor:cu2">
+                <span class="palette-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-database"></use></svg></span>
+                <span class="palette-label">Cursor 的 state.vscdb 索引结构</span>
+                <span class="palette-meta">Cursor · 今天 14:47</span>
+              </button>
+              <button class="palette-row" type="button" data-uid="codex:x2">
+                <span class="palette-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg></span>
+                <span class="palette-label">给 CLI 加一个 --dry-run</span>
+                <span class="palette-meta">Codex · 昨天 21:55</span>
+              </button>
+            </div>
+
+            <div class="palette-group">
+              <div class="palette-group-title">动作</div>
+              <button class="palette-row" type="button" data-action="scan">
+                <span class="palette-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-scan"></use></svg></span>
+                <span class="palette-label">扫描本机会话</span>
+                <kbd class="kbd">⌘R</kbd>
+              </button>
+              <button class="palette-row" type="button" data-action="settings">
+                <span class="palette-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-gear"></use></svg></span>
+                <span class="palette-label">打开设置</span>
+                <kbd class="kbd">⌘,</kbd>
+              </button>
+              <button class="palette-row" type="button" data-action="discover">
+                <span class="palette-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-sparkle"></use></svg></span>
+                <span class="palette-label">发现未收录目录</span>
+                <kbd class="kbd">⌘⇧D</kbd>
+              </button>
+              <button class="palette-row" type="button" data-action="toggle-detail">
+                <span class="palette-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-panel"></use></svg></span>
+                <span class="palette-label">切换详情面板</span>
+                <kbd class="kbd">⌘\</kbd>
+              </button>
+            </div>
+
+            <div class="palette-group">
+              <div class="palette-group-title">Agent</div>
+              <button class="palette-row" type="button" data-agent="all">
+                <span class="palette-icon" aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg></span>
+                <span class="palette-label">全部会话</span>
+                <span class="palette-meta">26 条</span>
+              </button>
+              <button class="palette-row" type="button" data-agent="claude-code">
+                <span class="palette-icon palette-agent-icon" style="--agent-color:#C15F3C" aria-hidden="true"><span class="agent-initial">C</span></span>
+                <span class="palette-label">Claude Code</span>
+                <span class="palette-meta">9 条</span>
+              </button>
+              <button class="palette-row" type="button" data-agent="cursor">
+                <span class="palette-icon palette-agent-icon" style="--agent-color:#2F3437" aria-hidden="true"><span class="agent-initial">Cu</span></span>
+                <span class="palette-label">Cursor</span>
+                <span class="palette-meta">8 条</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="paletteEmpty" class="palette-empty" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-command"></use></svg>
+            <p>没有匹配的命令</p>
+            <span>试试「扫描」「设置」或 Agent 名称</span>
+          </div>
+
+          <footer class="palette-foot">
+            <span><kbd class="kbd">↑</kbd><kbd class="kbd">↓</kbd> 移动</span>
+            <span><kbd class="kbd">↵</kbd> 执行</span>
+            <span><kbd class="kbd">esc</kbd> 关闭</span>
+          </footer>
+        </div>
+
+        <div id="filterPopover" class="popover filter-popover" role="menu" aria-label="筛选会话" hidden>
+          <div class="popover-group" data-filter-group="storage">
+            <div class="popover-label popover-group-label">存储</div>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="storage" data-value="all" aria-checked="true"><span class="popover-item-label">全部</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="storage" data-value="file" aria-checked="false"><span class="popover-item-label">文件</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="storage" data-value="dir" aria-checked="false"><span class="popover-item-label">目录</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="storage" data-value="sqlite" aria-checked="false"><span class="popover-item-label">SQLite</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+          </div>
+          <div class="popover-group" data-filter-group="age">
+            <div class="popover-label popover-group-label">时间</div>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="age" data-value="all" aria-checked="true"><span class="popover-item-label">全部</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="age" data-value="today" aria-checked="false"><span class="popover-item-label">今天</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="age" data-value="7d" aria-checked="false"><span class="popover-item-label">7 天内</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="age" data-value="30d" aria-checked="false"><span class="popover-item-label">30 天内</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="age" data-value="older" aria-checked="false"><span class="popover-item-label">更早</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+          </div>
+          <div class="popover-group" data-filter-group="size">
+            <div class="popover-label popover-group-label">体积</div>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="size" data-value="all" aria-checked="true"><span class="popover-item-label">全部</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="size" data-value="small" aria-checked="false"><span class="popover-item-label">小于 10 KB</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="size" data-value="medium" aria-checked="false"><span class="popover-item-label">10 KB–1 MB</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+            <button class="popover-item" type="button" role="menuitemradio" data-filter="size" data-value="large" aria-checked="false"><span class="popover-item-label">大于 1 MB</span><svg class="icon popover-check" aria-hidden="true"><use href="#i-check"></use></svg></button>
+          </div>
+          <div class="popover-footer">
+            <button id="filterReset" class="popover-reset" type="button">重置筛选</button>
+            <span class="popover-hint">即时生效</span>
+          </div>
+        </div>
+
+        <div id="quickPopover" class="popover quick-popover" role="menu" aria-label="快速选择" hidden>
+          <div class="popover-label popover-group-label">快速选择</div>
+          <button class="popover-item quick-option" type="button" data-quick="old"><svg class="icon" aria-hidden="true"><use href="#i-clock"></use></svg><span class="popover-item-label quick-label">超过 30 天</span></button>
+          <button class="popover-item quick-option" type="button" data-quick="empty"><svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg><span class="popover-item-label quick-label">空会话</span></button>
+          <button class="popover-item quick-option" type="button" data-quick="largest"><svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg><span class="popover-item-label quick-label">最大 10 条</span></button>
+          <div class="popover-sep quick-sep" role="separator"></div>
+          <button class="popover-item quick-option" type="button" data-quick="all"><svg class="icon" aria-hidden="true"><use href="#i-check-square"></use></svg><span class="popover-item-label quick-label">全部可见</span><kbd class="kbd">⌘A</kbd></button>
+          <button class="popover-item quick-option" type="button" data-quick="clear"><svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg><span class="popover-item-label quick-label">清除选择</span><kbd class="kbd">Esc</kbd></button>
+        </div>
+
+        <div id="contextMenu" class="menu context-menu" role="menu" aria-label="会话操作" hidden>
+          <button class="menu-item" type="button" data-menu="reveal"><svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg><span>在 Finder 中显示</span></button>
+          <button class="menu-item" type="button" data-menu="copy"><svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg><span>复制路径</span></button>
+          <div class="menu-sep" role="separator"></div>
+          <button class="menu-item" type="button" data-menu="toggle"><svg class="icon" aria-hidden="true"><use href="#i-check-square"></use></svg><span>选中此条</span><kbd class="kbd">Space</kbd></button>
+          <button class="menu-item is-danger" type="button" data-menu="clean"><svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg><span>清理此条…</span></button>
+        </div>
+
+        <div id="toasts" class="toast-stack" aria-live="polite" aria-relevant="additions"></div>
+      </div>
+    </div>
+
+    <div class="proto-dock" id="protoDock" role="toolbar" aria-label="原型控制台">
+      <span class="dock-brand"><span class="dock-dot" aria-hidden="true"></span>PROTOTYPE</span>
+
+      <div class="dock-group">
+        <span class="dock-label">外观</span>
+        <div class="dock-seg" role="radiogroup" aria-label="原型外观">
+          <label><input type="radio" name="dockTheme" value="auto" checked><span>自动</span></label>
+          <label><input type="radio" name="dockTheme" value="light"><span>浅色</span></label>
+          <label><input type="radio" name="dockTheme" value="dark"><span>深色</span></label>
+        </div>
+      </div>
+
+      <div class="dock-group">
+        <span class="dock-label">状态</span>
+        <div class="dock-seg" id="dockState" role="group" aria-label="演示状态">
+          <button class="is-active" type="button" data-demo="idle">正常</button>
+          <button type="button" data-demo="scanning">扫描中</button>
+          <button type="button" data-demo="empty">空列表</button>
+          <button type="button" data-demo="noresults">无结果</button>
+          <button type="button" data-demo="error">部分失败</button>
+        </div>
+      </div>
+
+      <div class="dock-group">
+        <span class="dock-label">打开</span>
+        <div class="dock-seg" id="dockPanels" role="group" aria-label="打开浮层">
+          <button type="button" data-open="review">清理确认</button>
+          <button type="button" data-open="discover">发现</button>
+          <button type="button" data-open="settings">设置</button>
+          <button type="button" data-open="palette">命令面板</button>
+          <button type="button" data-open="shortcuts">快捷键</button>
+        </div>
+      </div>
+
+      <div class="dock-actions">
+        <button id="dockReset" type="button">重置演示</button>
+        <button id="dockHide" type="button">隐藏</button>
+      </div>
+    </div>
+
+    <button class="proto-dock-toggle" id="protoDockToggle" type="button" aria-label="显示原型控制台" hidden>原型</button>
+  </div>
+</div>
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -65,6 +65,7 @@ func fixtureService(t *testing.T, mode string) (*Service, catalog.Spec, string) 
 		svc.byUID[item.UID] = item
 	}
 	svc.appDir = t.TempDir()
+	svc.icons = newIconStore(filepath.Join(svc.appDir, "icons"))
 	svc.cleaner = clean.New(clean.Options{
 		Mode:       mode,
 		BackupDir:  filepath.Join(svc.appDir, "backups"),

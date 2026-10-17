@@ -19,7 +19,8 @@
   "version": "0.1.0",
   "home": "/Users/x",
   "platform": "darwin",
-  "prefs": { "deleteMode": "trash", "confirmBeforeDelete": true, "includeSnapshots": true, "autoScan": true },
+  "prefs": { "deleteMode": "trash", "confirmBeforeDelete": true, "includeSnapshots": true,
+             "autoScan": true, "autoCheckUpdates": true },
   "scan": { "status": "done", "startedAt": "...", "finishedAt": "...", "durationMs": 1234,
             "progress": { "done": 12, "total": 30, "current": "Cursor" },
             "issues": [ { "agentId": "cursor", "message": "…" } ] },
@@ -127,7 +128,61 @@
 
 ## GET /api/prefs · PUT /api/prefs
 
-`prefs` 形状同 bootstrap。PUT 只接受局部字段。
+`prefs` 形状同 bootstrap。PUT 只接受局部字段，`autoCheckUpdates` 也在其中
+（关闭只是不再在启动时自动查；设置里的「检查更新」按钮仍然可用）。
+
+## GET /api/update
+
+返回更新状态机。前端按 `state` 分支渲染，其余字段都是文案素材。
+
+```json
+{
+  "state": "available",
+  "current": "0.1.0",
+  "latest": "0.1.1",
+  "available": true,
+  "notes": "发布说明（release body 原文）",
+  "pageUrl": "https://github.com/ruanbw/agent-sweep/releases/tag/v0.1.1",
+  "assetName": "AgentSweep-v0.1.1-darwin-universal.zip",
+  "assetBytes": 20123456,
+  "progress": 0,
+  "checkedAt": "2026-10-17T22:30:00+08:00",
+  "error": "",
+  "canApply": true,
+  "autoCheck": true
+}
+```
+
+`state` 取值：
+
+| 值 | 含义 |
+|---|---|
+| `idle` | 还没查过 |
+| `checking` | 正在查 GitHub |
+| `available` | 有新版本，可以一键安装 |
+| `unsupported` | 有新版本，但当前不是从 `.app` 运行（或本平台没有包），只能去发布页 |
+| `uptodate` | 已是最新 |
+| `downloading` | 正在下载（`progress` 0–78） |
+| `installing` | 正在校验 / 解压 / 替换（`progress` 78–100） |
+| `done` | 装完了，进程即将退出并由脚本重新拉起 |
+| `error` | 查或装失败，原因在 `error` |
+
+检查结果会在 `~/Library/Application Support/AgentSweep/update.json` 缓存 6 小时 ——
+GitHub 匿名 API 有速率限制，启动时没必要每次都联网。
+
+## POST /api/update/check
+
+同步查一次最新发布（最长约 25s），返回同上的状态对象。并发调用会复用当前状态，
+不会打出多个请求。失败也返回 200，`state=error`，上一次已知的版本信息会保留。
+
+## POST /api/update/apply
+
+`{"ok":true}` 立即返回，随后在后台下载 → 核对 `checksums.txt` 里的 SHA-256 →
+解压 → 校验包内 `Info.plist` 版本 → 替换当前 `.app` → 退出并重启。
+期间用 `GET /api/update` 轮询进度。没有新版本、或当前不是从 `.app` 运行时返回 400。
+
+安装只发生在**当前运行的 app bundle** 上，下载与解压落在
+`~/Library/Caches/AgentSweep/updates/`。任一步失败，旧包保持原样。
 
 ## POST /api/reveal
 
@@ -136,3 +191,13 @@
 ## POST /api/open
 
 `{"path":"/abs/path"}` → 用默认程序打开。
+
+## GET /api/icon?id=<agentId>
+
+返回该 Agent 的官方图标（128×128 PNG）。macOS 上从已安装的 `.app` bundle 里取
+`CFBundleIconFile`，用 `sips` 转成 PNG 并缓存在
+`~/Library/Application Support/AgentSweep/icons/`。
+
+取不到时返回 404 —— 前端会回退到二进制内置的品牌矢量图，再回退到名字首字母，
+所以这个接口失败不影响任何功能。内置目录里的 Agent 大多没有 `.app`（Claude Code、
+Codex 都是纯命令行），它们的图标由前端内置，不会请求这个接口。

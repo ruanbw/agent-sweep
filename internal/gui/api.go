@@ -16,6 +16,7 @@ import (
 	"github.com/ruanbw/agent-sweep/internal/probe"
 	"github.com/ruanbw/agent-sweep/internal/scan"
 	"github.com/ruanbw/agent-sweep/internal/session"
+	"github.com/ruanbw/agent-sweep/internal/update"
 )
 
 // Prefs 是落盘契约。键名不要改：改一个等于静默丢弃用户已保存的设置。
@@ -24,6 +25,7 @@ type Prefs struct {
 	ConfirmBeforeDelete bool   `json:"confirmBeforeDelete"`
 	IncludeSnapshots    bool   `json:"includeSnapshots"`
 	AutoScan            bool   `json:"autoScan"`
+	AutoCheckUpdates    bool   `json:"autoCheckUpdates"`
 }
 
 func defaultPrefs() Prefs {
@@ -32,6 +34,7 @@ func defaultPrefs() Prefs {
 		ConfirmBeforeDelete: true,
 		IncludeSnapshots:    true,
 		AutoScan:            true,
+		AutoCheckUpdates:    true,
 	}
 }
 
@@ -108,6 +111,16 @@ type Service struct {
 	scanning bool
 	cleaner  *clean.Cleaner
 	found    []probe.Candidate
+	icons    *iconStore
+
+	// 更新相关的状态都在 update.go 里维护，这里只放字段：
+	// updater 在 NewService 之后不再改变，updateView / lastRelease 由 mu 保护。
+	updater     *update.Client
+	updateView  UpdateView
+	updateBusy  bool
+	updateCache string
+	lastRelease *update.Release
+	onRestart   func()
 }
 
 func NewService(version string) *Service {
@@ -119,13 +132,16 @@ func NewService(version string) *Service {
 		byUID:   map[string]session.Session{},
 		// Issues 给空切片而不是 nil：nil 会序列化成 null，
 		// 前端 `issues.length` 直接抛错 —— 契约里写的是数组，就得是数组。
-		scan: ScanStatus{Status: "idle", Issues: []ScanIssue{}},
+		scan:  ScanStatus{Status: "idle", Issues: []ScanIssue{}},
+		icons: newIconStore(filepath.Join(appDir, "icons")),
 	}
 	svc.cleaner = clean.New(clean.Options{
 		Mode:       svc.prefs.DeleteMode,
 		BackupDir:  filepath.Join(appDir, "backups"),
 		JournalDir: filepath.Join(appDir, "journal"),
 	})
+	svc.updater = update.NewClient(version)
+	svc.initUpdate()
 	return svc
 }
 
@@ -140,6 +156,10 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/prefs", s.handlePrefs)
 	mux.HandleFunc("/api/reveal", s.handleReveal)
 	mux.HandleFunc("/api/open", s.handleOpen)
+	mux.HandleFunc("/api/icon", s.handleIcon)
+	mux.HandleFunc("/api/update", s.handleUpdate)
+	mux.HandleFunc("/api/update/check", s.handleUpdateCheck)
+	mux.HandleFunc("/api/update/apply", s.handleUpdateApply)
 	mux.Handle("/", staticHandler())
 	return mux
 }
@@ -536,6 +556,7 @@ func (s *Service) handlePrefs(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		prefs := s.prefs
 		s.mu.Unlock()
+		autoCheckBefore := prefs.AutoCheckUpdates
 		if value, ok := raw["deleteMode"]; ok {
 			var mode string
 			if json.Unmarshal(value, &mode) == nil && (mode == "trash" || mode == "permanent") {
@@ -546,6 +567,7 @@ func (s *Service) handlePrefs(w http.ResponseWriter, r *http.Request) {
 			"confirmBeforeDelete": &prefs.ConfirmBeforeDelete,
 			"includeSnapshots":    &prefs.IncludeSnapshots,
 			"autoScan":            &prefs.AutoScan,
+			"autoCheckUpdates":    &prefs.AutoCheckUpdates,
 		} {
 			if value, ok := raw[key]; ok {
 				_ = json.Unmarshal(value, target)
@@ -559,6 +581,9 @@ func (s *Service) handlePrefs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, prefs)
+		if prefs.AutoCheckUpdates && !autoCheckBefore {
+			go s.autoCheckUpdates()
+		}
 	default:
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 	}
