@@ -239,15 +239,27 @@ func Builtin() []Spec {
 		{
 			ID: "codebuddy", Name: "CodeBuddy", Group: GroupIDE, Vendor: "Tencent",
 			Bundles: []string{"CodeBuddy.app"},
-			Roots:   []string{"~/Library/Application Support/CodeBuddy", "~/.codebuddy"},
+			// IDE 与 CLI 的数据根不同，必须拆成两条：Spec.Home 只取第一个存在的
+			// 根，合并时本机 IDE 根一存在，CLI 的 projects/* 就永远在 IDE 根下找，
+			// 扫不到；用户也没法只清其中一个。先例见 trae / trae-cn。
+			Roots: []string{"~/Library/Application Support/CodeBuddy"},
 			Stores: []Store{
 				jsonStore("User/workspaceStorage/*/chatSessions/*.json"),
-				// CodeBuddy Code（CLI）与 Claude Code 同构：projects/<mangled-cwd>/<id>.jsonl，
-				// 子代理在同一层的 <id>/subagents/agent-*.jsonl。IDE 版是 VS Code fork
-				// 的 chatSessions，两者互不影响，所以两条 Store 都要留着。
+			},
+			Note: "IDE 版（VS Code fork）的会话在 workspaceStorage/chatSessions 下；CLI 版是独立的 codebuddy-cli 条目。",
+		},
+		{
+			// 与 IDE 版拆开的原因同上：Home 只取第一个存在的根。CLI 版的数据根是
+			// ~/.codebuddy，和 IDE 的 Application Support 目录互不覆盖，塞进同一条
+			// 只会让其中一边永远扫不到。
+			ID: "codebuddy-cli", Name: "CodeBuddy Code", Group: GroupCLI, Vendor: "Tencent",
+			Roots: []string{"~/.codebuddy"},
+			Stores: []Store{
+				// 与 Claude Code 同构：projects/<mangled-cwd>/<id>.jsonl，
+				// 子代理在同一层的 <id>/subagents/agent-*.jsonl。
 				jsonlStore("projects/*/*.jsonl"),
 			},
-			Note: "IDE 版在 workspaceStorage/chatSessions，CLI 版在 projects/ 下（Claude Code 同构）。",
+			Note: "CLI 版，与 Claude Code 同构；IDE 版是独立的 codebuddy 条目。",
 		},
 		{
 			ID: "workbuddy", Name: "WorkBuddy", Group: GroupApp, Vendor: "Tencent",

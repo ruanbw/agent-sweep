@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -127,5 +128,68 @@ func TestDevinCLIDoesNotTreatXDGDataHomeAsDataRoot(t *testing.T) {
 	// 展开值。不硬断具体路径，因为后者取决于本机是否真的有这个目录。
 	if wantRoot := expand("~/.local/share/devin"); got != "" && got != wantRoot {
 		t.Fatalf("Home = %q，只允许空串或 Roots 展开值 %q", got, wantRoot)
+	}
+}
+
+// TestCodeBuddyIDECLIConfigsAreSplit 钉住「IDE 与 CLI 必须两条声明」。
+//
+// Spec.Home 只返回第一个存在的根，所以把两个数据根塞进同一条 Spec 时，只有
+// 排在前面的那个能被扫描到 —— 本机 IDE 根存在，CLI 的 projects/*/*.jsonl 就
+// 永远在 IDE 根下找。这不是扫描引擎的 bug，是声明必须按数据根拆开，先例是
+// trae / trae-cn 和 cursor / cursor-agent-cli。
+//
+// 断言分两层：Roots 各管一边（防止再把 ~/.codebuddy 塞回 IDE 那条），
+// 以及 Store glob 各归其位（防止有人把两条 Store 合并回去 —— 合并后即使
+// Roots 拆开，总有一条 Store 会在错误的根下空转）。
+func TestCodeBuddyIDECLIConfigsAreSplit(t *testing.T) {
+	specs := Builtin()
+	var ide, cli *Spec
+	for i := range specs {
+		switch specs[i].ID {
+		case "codebuddy":
+			ide = &specs[i]
+		case "codebuddy-cli":
+			cli = &specs[i]
+		}
+	}
+	if ide == nil {
+		t.Fatal("内置目录里没有 codebuddy（IDE 版），测试需随声明更新")
+	}
+	if cli == nil {
+		t.Fatal("内置目录里没有 codebuddy-cli：CLI 会话会重新变成扫不到")
+	}
+	if ide.Group != GroupIDE {
+		t.Errorf("codebuddy 的分组 = %q，want %q", ide.Group, GroupIDE)
+	}
+	if cli.Group != GroupCLI {
+		t.Errorf("codebuddy-cli 的分组 = %q，want %q", cli.Group, GroupCLI)
+	}
+
+	for _, root := range ide.Roots {
+		if root == "~/.codebuddy" {
+			t.Errorf("IDE 版的 Roots 里又混进了 CLI 根 ~/.codebuddy：Home 只取第一个存在的根，CLI 会被压住")
+		}
+	}
+	if len(cli.Roots) != 1 || cli.Roots[0] != "~/.codebuddy" {
+		t.Errorf("codebuddy-cli 的 Roots = %v，want 只有 [~/.codebuddy]", cli.Roots)
+	}
+
+	// 每条 Store 的 glob 都要落在自己的根下：IDE 走 VS Code fork 的
+	// workspaceStorage，CLI 走 Claude Code 同构的 projects/。
+	if len(ide.Stores) == 0 {
+		t.Error("codebuddy 没有 Store")
+	}
+	for _, store := range ide.Stores {
+		if !strings.HasPrefix(store.Glob, "User/workspaceStorage") {
+			t.Errorf("IDE 版的 Store glob = %q，应以 User/workspaceStorage 开头（CLI 的 projects/ 属于 codebuddy-cli）", store.Glob)
+		}
+	}
+	if len(cli.Stores) == 0 {
+		t.Error("codebuddy-cli 没有 Store")
+	}
+	for _, store := range cli.Stores {
+		if !strings.HasPrefix(store.Glob, "projects/") {
+			t.Errorf("CLI 版的 Store glob = %q，应以 projects/ 开头（IDE 的 chatSessions 属于 codebuddy）", store.Glob)
+		}
 	}
 }
