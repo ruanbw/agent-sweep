@@ -7,10 +7,12 @@
 package fsx
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // Glob 在 root 下展开 pattern，支持 `*`（单段）与 `**`（任意层）。
@@ -159,7 +161,36 @@ func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
 	if err := os.Chmod(tmpName, perm); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// rename 只改了目录项，目录项本身还在页缓存里。掉电后可能回退到旧目录，
+	// 表现为「文件写了但没了」——对 journal 来说，等价于删除做了却没有账本。
+	return syncDir(dir)
+}
+
+// syncDir 把目录项变更刷到磁盘。
+//
+// 部分平台/文件系统不支持对目录 fsync（EINVAL / ENOTSUP / ENOSYS），这种
+// 情况视为「无法提供额外保证」，不算失败；其余错误照常返回。
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil && !dirSyncUnsupported(syncErr) {
+		return syncErr
+	}
+	return closeErr
+}
+
+// dirSyncUnsupported 判断目录 fsync 的失败是否只表示「本平台不支持」。
+func dirSyncUnsupported(err error) bool {
+	return errors.Is(err, syscall.EINVAL) ||
+		errors.Is(err, syscall.ENOTSUP) ||
+		errors.Is(err, syscall.ENOSYS)
 }
 
 func sortStrings(values []string) {

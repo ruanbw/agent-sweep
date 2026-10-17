@@ -3,6 +3,7 @@ package clean
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -281,10 +282,15 @@ func pathExists(path string) bool {
 // 把新事务重放到旧库上，轻则数据错乱，重则直接损坏。撤销的正确性优先于
 // 「保留删除之后其他人写入的变更」——那些变更本来就在这次撤销的语义之外。
 //
-// 这里故意不返回错误：sidecar 删不掉通常是权限问题，但主库覆盖仍可继续；
-// 让一个可清理的边角文件阻断整个撤销，对用户来说是更糟的取舍。
-func removeSQLiteSidecars(path string) {
+// 删除失败必须交给调用方：残留的新 WAL 一旦在下次打开时重放到被覆盖的旧库上，
+// 结果就是库损坏，而静默吞错会让这个风险完全不可见。ENOENT 是正常情况
+// （库可能本来就没有 sidecar），不算错误；其余失败逐条收集后返回。
+func removeSQLiteSidecars(path string) error {
+	var errs []error
 	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
-		_ = os.Remove(path + suffix)
+		if err := os.Remove(path + suffix); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("删除 %s 失败: %w", path+suffix, err))
+		}
 	}
+	return errors.Join(errs...)
 }

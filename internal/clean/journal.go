@@ -195,7 +195,10 @@ func (c *Cleaner) Undo(batchID string) (UndoResult, error) {
 		if entry.Backup == "" {
 			continue
 		}
-		removeSQLiteSidecars(entry.DB)
+		if err := removeSQLiteSidecars(entry.DB); err != nil {
+			out.Errors = append(out.Errors, fmt.Sprintf("清理数据库 sidecar 失败，已跳过恢复 %s: %v", entry.DB, err))
+			continue
+		}
 		if err := copyFileAtomic(entry.Backup, entry.DB); err != nil {
 			out.Errors = append(out.Errors, fmt.Sprintf("恢复数据库 %s 失败: %v", entry.DB, err))
 			continue
