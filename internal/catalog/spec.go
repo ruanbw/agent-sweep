@@ -12,6 +12,7 @@
 package catalog
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,3 +155,35 @@ func expand(p string) string {
 
 // Expand 暴露给其它包用（用户自定义适配器里也会写 `~/...`）。
 func Expand(p string) string { return expand(p) }
+
+// ValidateDataRoot 判断一个「数据根」是否可信。
+//
+// 数据根优先由环境变量决定：Home 命中 Env 就直接返回变量值，不做任何路径
+// 收敛。删除侧又以这个根作为「路径必须落在根内」的边界，扫描侧则从它开始
+// 遍历 —— 所以根一旦是文件系统根、卷根，或用户主目录本身，护栏就形同虚设：
+// / 之下什么路径都「在根内」，等于没有边界。误配的 CLAUDE_CONFIG_DIR=/、
+// 被脚本污染的 CODEX_HOME=~，都会把删除变成对整棵树开口子，因此凡是拿根
+// 做包含性校验的调用方（clean / scan）都必须先过这里。
+//
+// 不检查存在性：根暂时不存在是正常的（还没用过、外置盘没挂上）。删除会在
+// 打开库/文件时因 IO 失败报错，扫描本就允许根暂时为空。
+func ValidateDataRoot(home string) error {
+	if home == "" {
+		return fmt.Errorf("数据根为空")
+	}
+	if !filepath.IsAbs(home) {
+		return fmt.Errorf("数据根不是绝对路径: %s", home)
+	}
+	clean := filepath.Clean(home)
+	// 卷根（含 /）的特征是「父目录就是自己」。
+	if filepath.Dir(clean) == clean {
+		return fmt.Errorf("数据根不能是文件系统根或卷根: %s", clean)
+	}
+	if userHome, err := os.UserHomeDir(); err == nil && userHome != "" {
+		// 两边都 Clean 再比：结尾多一条斜杠不该让校验漏判。
+		if filepath.Clean(userHome) == clean {
+			return fmt.Errorf("数据根不能是用户主目录: %s", clean)
+		}
+	}
+	return nil
+}

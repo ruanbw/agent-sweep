@@ -182,6 +182,13 @@ func One(spec catalog.Spec) AgentResult {
 	if home == "" {
 		return result
 	}
+	// 数据根不可信时不要遍历：Home 直接采信 Env 的值，误配一个
+	// CLAUDE_CONFIG_DIR=/ 就会让扫描去走整棵树，而且结果里的「已安装」
+	// 没有任何意义。Installed 保持 false，只把原因挂到 Err 上。
+	if err := catalog.ValidateDataRoot(home); err != nil {
+		result.Err = fmt.Sprintf("拒绝扫描不可信的数据根：%v", err)
+		return result
+	}
 	result.Installed = true
 	result.Home = home
 

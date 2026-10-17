@@ -269,6 +269,14 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 			fmt.Errorf("clean: 未知删除模式 %q（只支持 trash 或 permanent）", c.opts.Mode)
 	}
 
+	// 数据根不可信时，「路径必须落在根内」的护栏没有意义：根是 / 或用户主目录
+	// 时，任何路径都算「在根内」，继续删等于把用户数据暴露在误配之下。必须在
+	// 取锁、预留批次之前拒绝 —— 失败路径不写 journal、不碰磁盘，用户拿到的
+	// 是明确错误，而不是一份指向整棵树的删除账本。
+	if err := catalog.ValidateDataRoot(home); err != nil {
+		return Result{Errors: []ItemError{}}, fmt.Errorf("clean: 拒绝使用不可信的数据根: %w", err)
+	}
+
 	opMu.Lock()
 	defer opMu.Unlock()
 
