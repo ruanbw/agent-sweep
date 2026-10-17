@@ -1,0 +1,5 @@
+bin/
+AgentSweep.app/
+*.app/
+.DS_Store
+*.log

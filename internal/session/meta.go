@@ -1,0 +1,475 @@
+package session
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/klauspost/compress/zstd"
+)
+
+// Meta 是从会话正文里尽力抽出来的元数据。
+//
+// 全部字段都可能为零值：各家格式差异太大，抽不到就退回文件名 / mtime。
+// 这里的原则是「宁可信息少，不可信息错」—— 标题抽错了用户会以为是会话串了。
+type Meta struct {
+	Title    string
+	Project  string
+	Time     time.Time
+	Messages int
+	Snippet  string
+}
+
+// 标题字段的候选键，按可信度排序。
+var titleKeys = []string{
+	"title", "name", "summary", "slug", "display", "firstMessage",
+	"first_message", "prompt", "description", "conversation_title",
+}
+
+// 项目路径的候选键。
+var projectKeys = []string{
+	"cwd", "projectPath", "project_path", "project", "directory",
+	"workspace", "workspacePath", "folder_paths", "folderPaths", "path",
+}
+
+// 时间字段的候选键。
+var timeKeys = []string{
+	"timestamp", "createdAt", "created_at", "updatedAt", "updated_at",
+	"lastModified", "last_modified", "last_modified_time", "time_updated",
+	"timeUpdated", "mtime", "date", "created", "updated",
+}
+
+// 这些角色的话绝不能当标题：它们是提示词 / 工具说明，不是用户说的话。
+var nonUserRoles = map[string]bool{
+	"system": true, "developer": true, "tool": true, "function": true,
+}
+
+// ReadMeta 读一个会话文件并抽元数据。
+//
+// 关键设计：**按需读，而不是固定读 64KB**。
+// Pi 的会话前 71KB 是系统提示词，固定 64KB 会一条标题都抽不到，
+// 列表里全变成「会话 2026-10-」。这里从 64KB 起、每次翻 4 倍、
+// 最多 1MB，**一旦拿到标题就停** —— 绝大多数文件第一次就结束，
+// 只有 Pi 这种系统提示词特别长的才多读一轮。
+func ReadMeta(path string, jsonl bool) Meta {
+	const (
+		first = 64 * 1024
+		last  = 1024 * 1024
+	)
+	var meta Meta
+	for limit := int64(first); limit <= last; limit *= 4 {
+		head, err := readHead(path, limit)
+		if err != nil {
+			return meta
+		}
+		if jsonl {
+			meta = ParseJSONL(head)
+		} else {
+			meta = ParseJSONObject(head)
+		}
+		// 文件比 limit 短说明已经读完了，再读也没用。
+		if meta.Title != "" || int64(len(head)) < limit {
+			return meta
+		}
+	}
+	return meta
+}
+
+// ReadMetaZstd 从 zstd 压缩的 JSONL 里抽元数据（DeepSeek Harness 就是这么存的）。
+//
+// 解压是有上限的：只解前 1MB 压缩流、最多 512KB 明文。
+// 会话正文可能有几百 MB，为了一个标题把整份解压出来是不可接受的 ——
+// 而标题、cwd、时间戳都在头几行。
+func ReadMetaZstd(path string) Meta {
+	file, err := os.Open(path)
+	if err != nil {
+		return Meta{}
+	}
+	defer file.Close()
+
+	decoder, err := zstd.NewReader(io.LimitReader(file, 1<<20))
+	if err != nil {
+		return Meta{}
+	}
+	defer decoder.Close()
+
+	head, _ := io.ReadAll(io.LimitReader(decoder, 512*1024))
+	return ParseJSONL(head)
+}
+
+// ReadMetaDir 在一个「目录即会话」的目录里找可读元数据：
+// 先认常见的明文文件名，再认 zstd 压缩的 JSONL。都找不到就返回空 Meta。
+func ReadMetaDir(dir string) Meta {
+	names := []string{
+		"api_conversation_history.json", "conversation.json", "session.json",
+		"meta.json", "messages.json", "session.v4.jsonl.zstd", "session.jsonl.zstd",
+	}
+	for _, name := range names {
+		file := filepath.Join(dir, name)
+		if strings.HasSuffix(name, ".zstd") {
+			if meta := ReadMetaZstd(file); meta.Title != "" || meta.Project != "" {
+				return meta
+			}
+			continue
+		}
+		if meta := ReadMeta(file, strings.HasSuffix(name, ".jsonl")); meta.Title != "" || meta.Project != "" {
+			return meta
+		}
+	}
+	return Meta{}
+}
+
+func readHead(path string, limit int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	buf := make([]byte, limit)
+	n, err := file.Read(buf)
+	if err != nil && n == 0 {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+// ParseJSONL 从 JSONL 头部抽元数据。
+//
+// 逐行解析而不是整体 unmarshal：会话文件经常正在被写，末行是半截，
+// 整体解析会直接失败，逐行只有坏的那行被跳过。
+func ParseJSONL(head []byte) Meta {
+	var meta Meta
+	for _, line := range bytes.Split(head, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(line, &obj); err != nil {
+			continue
+		}
+		meta.merge(obj)
+		// 拿到标题且已经数过几条消息就可以停了：再往后翻收益递减。
+		if meta.Title != "" && meta.Messages > 2 {
+			break
+		}
+	}
+	return meta
+}
+
+// ParseJSONObject 从单条 JSON（可能是被截断的）里抽元数据。
+func ParseJSONObject(head []byte) Meta {
+	var meta Meta
+	var obj map[string]any
+	if err := json.Unmarshal(head, &obj); err == nil {
+		meta.merge(obj)
+		return meta
+	}
+	// 截断的 JSON：用逐行兜底，把能认出来的字符串捞出来。
+	if strings.Contains(string(head), "\"messages\"") || strings.Contains(string(head), "\"conversation\"") {
+		meta.mergeLoose(head)
+	}
+	return meta
+}
+
+// merge 把一条记录里的字段并进结果。后到的只填空，不覆盖已有值。
+func (m *Meta) merge(obj map[string]any) {
+	role := roleOf(obj)
+
+	// 标题：先认显式标题字段，再退回消息正文。
+	if m.Title == "" {
+		for _, key := range titleKeys {
+			if v, ok := obj[key].(string); ok && strings.TrimSpace(v) != "" {
+				m.Title = clean(v)
+				break
+			}
+		}
+	}
+	if m.Title == "" && !nonUserRoles[role] {
+		if text := contentText(contentOf(obj)); text != "" {
+			m.Title = clean(text)
+		}
+	}
+	// 有些 Agent 把消息裹了好几层（DSH 是 data.inserted[].content[]）。
+	// 深搜一次找「第一条 role=user 的正文」，比给每家写一个结构解析器划算。
+	if m.Title == "" {
+		if text := deepUserText(obj, 0); text != "" {
+			m.Title = clean(text)
+		}
+	}
+	// 还有一种：标题不在顶层，而在 payload.meta.title 这种包装层里
+	// （billion-context 就是）。只在还没标题时深搜，避免把内层工具消息当标题。
+	if m.Title == "" {
+		if text := deepTitle(obj, 0); text != "" {
+			m.Title = clean(text)
+		}
+	}
+
+	if m.Project == "" {
+		for _, key := range projectKeys {
+			switch v := obj[key].(type) {
+			case string:
+				if v != "" && strings.HasPrefix(v, "/") {
+					m.Project = v
+				}
+			case []any:
+				if len(v) > 0 {
+					if s, ok := v[0].(string); ok && strings.HasPrefix(s, "/") {
+						m.Project = s
+					}
+				}
+			}
+			if m.Project != "" {
+				break
+			}
+		}
+	}
+	if m.Time.IsZero() {
+		for _, key := range timeKeys {
+			if t, ok := parseTime(obj[key]); ok {
+				m.Time = t
+				break
+			}
+		}
+	}
+	// 时间也可能藏在 message 里（Pi 的 message.timestamp 是毫秒）。
+	if m.Time.IsZero() {
+		if msg, ok := obj["message"].(map[string]any); ok {
+			for _, key := range timeKeys {
+				if t, ok := parseTime(msg[key]); ok {
+					m.Time = t
+					break
+				}
+			}
+		}
+	}
+
+	if role == "user" || role == "assistant" {
+		m.Messages++
+	}
+	// 有些 Agent 用 type 而不是 role 标消息。
+	if typ, _ := obj["type"].(string); typ == "user" || typ == "assistant" {
+		m.Messages++
+	}
+
+	if m.Snippet == "" && !nonUserRoles[role] {
+		if text := contentText(contentOf(obj)); text != "" {
+			m.Snippet = clean(text)
+		}
+	}
+}
+
+// deepTitle 在嵌套结构里找显式标题字段（title / name / summary / slug）。
+//
+// 与 deepUserText 分开：标题是「作者写的」，正文是「用户说的」，
+// 前者可信度高，所以先找标题；但两者都可能藏在包装层里。
+func deepTitle(value any, depth int) string {
+	if depth > 6 {
+		return ""
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		for _, key := range titleKeys {
+			if text, ok := v[key].(string); ok {
+				text = strings.TrimSpace(text)
+				if text != "" {
+					return text
+				}
+			}
+		}
+		for _, key := range []string{"payload", "meta", "data", "conversation", "session", "thread", "details"} {
+			if child, ok := v[key]; ok {
+				if text := deepTitle(child, depth+1); text != "" {
+					return text
+				}
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if text := deepTitle(item, depth+1); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+// deepUserText 在任意嵌套结构里找第一条 role=user 的正文。
+// 只认 user：system / tool 动辄几万字，当标题等于把提示词贴进列表。
+func deepUserText(value any, depth int) string {
+	if depth > 8 {
+		return ""
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		if role, _ := v["role"].(string); role == "user" {
+			for _, key := range []string{"content", "parts", "text", "message"} {
+				if text := contentText(v[key]); text != "" {
+					return text
+				}
+			}
+		}
+		for _, key := range []string{"content", "parts", "message", "data", "inserted", "messages", "items", "payload", "event"} {
+			if child, ok := v[key]; ok {
+				if text := deepUserText(child, depth+1); text != "" {
+					return text
+				}
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if text := deepUserText(item, depth+1); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func roleOf(obj map[string]any) string {
+	if role, ok := obj["role"].(string); ok {
+		return role
+	}
+	if msg, ok := obj["message"].(map[string]any); ok {
+		if role, ok := msg["role"].(string); ok {
+			return role
+		}
+	}
+	return ""
+}
+
+func contentOf(obj map[string]any) any {
+	if content, ok := obj["content"]; ok {
+		return content
+	}
+	if msg, ok := obj["message"].(map[string]any); ok {
+		if content, ok := msg["content"]; ok {
+			return content
+		}
+	}
+	return nil
+}
+
+// mergeLoose 是截断 JSON 的兜底：只认 "key":"value" 形状。
+func (m *Meta) mergeLoose(head []byte) {
+	s := string(head)
+	for _, key := range titleKeys {
+		if m.Title != "" {
+			break
+		}
+		if v, ok := looseString(s, key); ok {
+			m.Title = clean(v)
+		}
+	}
+}
+
+// contentText 把各种 content 形态压成纯文本：
+// 字符串、[{type:"text", text:"…"}]、{text:"…"}。
+func contentText(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		var parts []string
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				parts = append(parts, s)
+				continue
+			}
+			if obj, ok := item.(map[string]any); ok {
+				if text, ok := obj["text"].(string); ok && text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, " "))
+	case map[string]any:
+		if text, ok := v["text"].(string); ok {
+			return strings.TrimSpace(text)
+		}
+	}
+	return ""
+}
+
+// parseTime 认三种真实存在的形态：epoch（秒/毫秒/纳秒）、ISO 字符串、Unix 数字字符串。
+func parseTime(value any) (time.Time, bool) {
+	switch v := value.(type) {
+	case float64:
+		return fromEpoch(int64(v)), true
+	case int64:
+		return fromEpoch(v), true
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return fromEpoch(n), true
+		}
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return time.Time{}, false
+		}
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return fromEpoch(n), true
+		}
+		for _, layout := range []string{
+			time.RFC3339Nano, time.RFC3339,
+			"2006-01-02T15:04:05.000Z",
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05",
+		} {
+			if t, err := time.Parse(layout, s); err == nil {
+				return t, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+// fromEpoch 按量级判断单位。1e12 以上是毫秒，1e17 以上是纳秒 ——
+// 各家混用得很随意，按阈值猜比要求每款 Agent 各写一个解析器现实。
+func fromEpoch(n int64) time.Time {
+	switch {
+	case n <= 0:
+		return time.Time{}
+	case n > 1e17:
+		return time.Unix(0, n)
+	case n > 1e12:
+		return time.UnixMilli(n)
+	default:
+		return time.Unix(n, 0)
+	}
+}
+
+func looseString(s, key string) (string, bool) {
+	needle := "\"" + key + "\":"
+	idx := strings.Index(s, needle)
+	if idx < 0 {
+		return "", false
+	}
+	rest := strings.TrimLeft(s[idx+len(needle):], " \t")
+	if len(rest) < 2 || rest[0] != '"' {
+		return "", false
+	}
+	rest = rest[1:]
+	end := strings.IndexByte(rest, '"')
+	if end < 0 {
+		return "", false
+	}
+	return rest[:end], true
+}
+
+// clean 压掉换行与多余空白，标题在列表里是单行渲染的。
+func clean(s string) string {
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.Join(strings.Fields(s), " ")
+	runes := []rune(s)
+	if len(runes) > 80 {
+		return strings.TrimSpace(string(runes[:80])) + "…"
+	}
+	return strings.TrimSpace(s)
+}

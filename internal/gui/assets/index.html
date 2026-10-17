@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>AgentSweep</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-scan" viewBox="0 0 24 24">
+    <path d="M23 4v6h-6"></path>
+    <path d="M1 20v-6h6"></path>
+    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"></path>
+    <path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+  </symbol>
+  <symbol id="i-search" viewBox="0 0 24 24">
+    <circle cx="11" cy="11" r="7"></circle>
+    <path d="m21 21-4.3-4.3"></path>
+  </symbol>
+  <symbol id="i-sparkle" viewBox="0 0 24 24">
+    <path d="m12 3 1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9Z"></path>
+    <path d="M19 15.5l.8 1.9 1.9.8-1.9.8-.8 1.9-.8-1.9-1.9-.8 1.9-.8Z"></path>
+  </symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24">
+    <rect x="3" y="4" width="18" height="16" rx="2.5"></rect>
+    <path d="M15 4v16"></path>
+  </symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="3"></circle>
+    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.35.4.65.73.86"></path>
+  </symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24">
+    <path d="M3 6h18"></path>
+    <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"></path>
+    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+    <path d="M10 11v6M14 11v6"></path>
+  </symbol>
+  <symbol id="i-x" viewBox="0 0 24 24">
+    <path d="M18 6 6 18M6 6l12 12"></path>
+  </symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24">
+    <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2h7.5A2.5 2.5 0 0 1 21 9.5v7a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5Z"></path>
+  </symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24">
+    <path d="M10.3 4.2 2.9 17a2 2 0 0 0 1.7 3h14.8a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0Z"></path>
+    <path d="M12 9v4M12 17h.01"></path>
+  </symbol>
+  <symbol id="i-info" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="9"></circle>
+    <path d="M12 11v5M12 8h.01"></path>
+  </symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24">
+    <path d="M3 3v6h6"></path>
+    <path d="M3.5 9a9 9 0 1 0 2.1 9.4"></path>
+  </symbol>
+  <symbol id="i-check" viewBox="0 0 24 24">
+    <path d="M20 6 9 17l-5-5"></path>
+  </symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24">
+    <path d="m12 3 9 5-9 5-9-5Z"></path>
+    <path d="m3 12 9 5 9-5"></path>
+    <path d="m3 16 9 5 9-5"></path>
+  </symbol>
+</svg>
+
+<div class="app" id="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round">
+          <path d="M4.2 15.6A8.2 8.2 0 0 1 18.8 7.1"></path>
+          <path d="M4.2 15.6H9"></path>
+          <path d="M4.2 15.6v-4.6"></path>
+          <circle cx="14" cy="15.2" r="2.3" fill="currentColor" stroke="none"></circle>
+        </svg>
+      </span>
+      <span class="brand-name">AgentSweep</span>
+      <span id="demoBadge" class="demo-badge" hidden title="无法连接后端，正在显示内置演示数据">演示数据</span>
+    </div>
+
+    <button id="scanBtn" class="btn btn-primary" type="button" title="扫描本机所有 Agent 的会话（⌘R）">
+      <svg class="icon" aria-hidden="true"><use href="#i-scan"></use></svg>
+      <span id="scanBtnLabel">扫描</span>
+      <kbd id="scanKbd">⌘R</kbd>
+    </button>
+
+    <div class="search" id="searchWrap">
+      <svg class="icon search-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+      <input id="searchInput" type="search" placeholder="搜索标题、路径或摘要" aria-label="搜索会话" autocomplete="off" spellcheck="false">
+      <kbd class="search-kbd" id="searchKbd">⌘F</kbd>
+      <button id="searchClear" class="search-clear" type="button" aria-label="清除搜索" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+      </button>
+    </div>
+
+    <button id="discoverBtn" class="btn btn-quiet discover-btn" type="button" title="查看发现的未收录 Agent">
+      <svg class="icon" aria-hidden="true"><use href="#i-sparkle"></use></svg>
+      <span>发现</span>
+      <span id="discoverCount" class="count-badge" hidden>0</span>
+      <span class="discover-label" id="discoverLabel" hidden>个未收录 Agent</span>
+    </button>
+
+    <button id="detailToggle" class="icon-btn is-active" type="button" aria-pressed="true" aria-label="隐藏详情面板" title="显示或隐藏详情面板">
+      <svg class="icon" aria-hidden="true"><use href="#i-panel"></use></svg>
+    </button>
+
+    <button id="settingsBtn" class="icon-btn" type="button" aria-label="设置" title="设置（清理方式与最近清理）">
+      <svg class="icon" aria-hidden="true"><use href="#i-gear"></use></svg>
+    </button>
+  </header>
+
+  <main class="main" id="main">
+    <aside class="sidebar" aria-label="Agent 列表">
+      <nav class="agent-scroll" id="agentScroll" aria-label="按 Agent 筛选">
+        <button id="agentAll" class="agent-row agent-all is-active" type="button" aria-current="true">
+          <span class="agent-glyph glyph-all" aria-hidden="true">
+            <svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg>
+          </span>
+          <span class="agent-name">全部会话</span>
+          <span class="agent-count" id="allCount">—</span>
+          <span class="agent-meta" id="allMeta">正在读取…</span>
+        </button>
+        <div id="agentGroups" class="agent-groups"></div>
+      </nav>
+    </aside>
+
+    <section class="list-pane" aria-label="会话列表">
+      <div class="list-head">
+        <span class="list-title" id="listTitle">全部会话</span>
+        <span class="list-sub" id="listSub">正在读取…</span>
+      </div>
+
+      <div class="table-wrap" id="tableWrap">
+        <table class="session-table">
+          <caption class="sr-only">会话列表，可勾选后清理</caption>
+          <colgroup>
+            <col class="col-check">
+            <col class="col-title">
+            <col class="col-project">
+            <col class="col-msg">
+            <col class="col-size">
+            <col class="col-time">
+          </colgroup>
+          <thead>
+            <tr>
+              <th scope="col" class="cell-check">
+                <input id="selectAll" type="checkbox" aria-label="全选当前列表" disabled>
+              </th>
+              <th scope="col" class="cell-title">
+                <button class="th-sort" type="button" data-sort="title">标题<span class="sort-caret" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="col-project">项目路径</th>
+              <th scope="col" class="cell-num">消息</th>
+              <th scope="col" class="cell-num">
+                <button class="th-sort" type="button" data-sort="bytes">体积<span class="sort-caret" aria-hidden="true"></span></button>
+              </th>
+              <th scope="col" class="cell-time">
+                <button class="th-sort" type="button" data-sort="updatedAt">最后更新<span class="sort-caret" aria-hidden="true"></span></button>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="sessionBody"></tbody>
+        </table>
+
+        <div id="initialLoading" class="loading-state" role="status">
+          <div class="loading-spinner" aria-hidden="true"></div>
+          <h3>正在读取本机会话…</h3>
+          <p>首次加载可能需要一两秒，读取完成后会自动选中第一条。</p>
+        </div>
+
+        <div id="emptyState" class="empty-state" hidden>
+          <div class="empty-icon" aria-hidden="true">
+            <svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg>
+          </div>
+          <h3 id="emptyTitle">还没有会话</h3>
+          <p id="emptyDesc"></p>
+          <div class="empty-actions">
+            <button id="emptyPrimary" class="btn" type="button">扫描</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="detail" id="detailPane" aria-label="会话详情">
+      <div class="detail-head">
+        <h2>详情</h2>
+        <button id="detailClose" class="icon-btn icon-btn-small" type="button" aria-label="隐藏详情面板" title="隐藏详情">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+      <div class="detail-body" id="detailBody"></div>
+    </aside>
+  </main>
+
+  <footer class="statusbar">
+    <div class="status-left" id="scanStatus"></div>
+    <div class="status-right">
+      <div class="selection" id="selectionSummary" aria-live="polite">
+        已选 <b>0</b> 条 · 合计 <b>0 B</b>
+      </div>
+      <button id="cleanBtn" class="btn btn-clean" type="button" disabled title="没有选中会话">
+        <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
+        <span>清理</span>
+      </button>
+    </div>
+  </footer>
+</div>
+
+<div id="sheetLayer" class="sheet-layer" hidden>
+  <button id="sheetBackdrop" class="sheet-backdrop" type="button" tabindex="-1" aria-label="关闭面板"></button>
+
+  <aside id="settingsSheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" tabindex="-1" hidden>
+    <header class="sheet-head">
+      <div class="sheet-title-wrap">
+        <h2 id="settingsTitle">设置</h2>
+        <p class="sheet-sub">更改会立即保存</p>
+      </div>
+      <button class="icon-btn sheet-close" type="button" aria-label="关闭设置" data-close-sheet="settings">
+        <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+      </button>
+    </header>
+
+    <div class="sheet-body">
+      <section class="section">
+        <h3 class="section-title">清理方式</h3>
+        <div class="segmented" role="radiogroup" aria-label="清理方式">
+          <label class="seg">
+            <input type="radio" name="deleteMode" value="trash">
+            <span>移入废纸篓</span>
+          </label>
+          <label class="seg">
+            <input type="radio" name="deleteMode" value="permanent">
+            <span>直接删除</span>
+          </label>
+        </div>
+        <p class="hint" id="deleteModeHint"></p>
+      </section>
+
+      <section class="section">
+        <h3 class="section-title">行为</h3>
+        <div class="pref-list">
+          <label class="pref-row">
+            <span class="pref-copy">
+              <span class="pref-title">清理前显示确认</span>
+              <span class="pref-desc">列出条数、体积和会受影响的 Agent</span>
+            </span>
+            <input id="prefConfirm" class="switch" type="checkbox">
+          </label>
+          <label class="pref-row">
+            <span class="pref-copy">
+              <span class="pref-title">包含快照</span>
+              <span class="pref-desc">把会话旁挂的快照文件也计入扫描结果</span>
+            </span>
+            <input id="prefSnapshots" class="switch" type="checkbox">
+          </label>
+          <label class="pref-row">
+            <span class="pref-copy">
+              <span class="pref-title">启动时自动扫描</span>
+              <span class="pref-desc">打开 AgentSweep 后自动读取一次</span>
+            </span>
+            <input id="prefAutoScan" class="switch" type="checkbox">
+          </label>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <h3 class="section-title">最近清理</h3>
+          <span class="section-note" id="batchNote"></span>
+        </div>
+        <div id="batchList" class="batch-list"></div>
+        <p class="hint">索引备份保存在 ~/Library/Application Support/AgentSweep/backups/。</p>
+      </section>
+
+      <footer class="sheet-foot">
+        AgentSweep <span id="versionLabel">0.1.0</span> · 所有数据都留在本机
+      </footer>
+    </div>
+  </aside>
+
+  <aside id="discoverSheet" class="sheet sheet-wide" role="dialog" aria-modal="true" aria-labelledby="discoverTitle" tabindex="-1" hidden>
+    <header class="sheet-head">
+      <div class="sheet-title-wrap">
+        <h2 id="discoverTitle">发现</h2>
+        <p class="sheet-sub">看起来像会话存储、但还没有收录的目录</p>
+      </div>
+      <button class="icon-btn sheet-close" type="button" aria-label="关闭发现面板" data-close-sheet="discover">
+        <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+      </button>
+    </header>
+
+    <div class="sheet-body">
+      <p class="hint">确认后会写入适配器目录，不需要重启。收录不会删除任何文件。</p>
+      <div id="discoverList" class="discover-list" aria-live="polite"></div>
+      <p class="sheet-foot-note">写入位置：~/Library/Application Support/AgentSweep/adapters.json</p>
+    </div>
+  </aside>
+</div>
+
+<div id="confirmModal" class="modal-layer" hidden>
+  <button id="modalBackdrop" class="modal-backdrop" type="button" tabindex="-1" aria-label="取消清理"></button>
+  <div class="modal" id="confirmDialog" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" tabindex="-1">
+    <h2 id="confirmTitle" class="modal-title">清理会话？</h2>
+    <p id="confirmLede" class="modal-lede"></p>
+    <div class="field-label" id="confirmAgentsLabel">会碰到的 Agent</div>
+    <div id="confirmAgents" class="agent-chips"></div>
+    <div id="confirmActive" class="callout callout-warn" hidden>
+      <svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg>
+      <span>有会话可能正在使用。清理前建议先退出对应的 Agent。</span>
+    </div>
+    <div id="confirmMode" class="callout">
+      <svg class="icon" aria-hidden="true"><use href="#i-info"></use></svg>
+      <span id="confirmModeText"></span>
+    </div>
+    <p id="confirmError" class="modal-error" hidden></p>
+    <div class="modal-actions">
+      <button id="confirmCancel" class="btn" type="button">取消</button>
+      <button id="confirmDelete" class="btn btn-danger" type="button">移入废纸篓</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite" aria-relevant="additions"></div>
+
+</body>
+</html>
