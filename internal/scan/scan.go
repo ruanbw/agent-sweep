@@ -820,7 +820,13 @@ func sessionLockState(paths ...string) lockState {
 // 一个自定义适配器写的 `../../outside` 会直接变成数据根之外的路径。删不删
 // 得掉由 clean 的 checkPathInHome 兜底，但扫描结果本身不能先不可信 —— UI
 // 会展示它，Bytes 也会把别人的文件算进来（R15）。
-func applyAssoc(home, base string, patterns []string, id string, item *session.Session, notices *[]scanNotice) {
+//
+// notices 是可选收集器：生产调用点都会传入，直接调用（例如测试）可以省略。
+func applyAssoc(home, base string, patterns []string, id string, item *session.Session, sinks ...*[]scanNotice) {
+	var notices *[]scanNotice
+	if len(sinks) > 0 {
+		notices = sinks[0]
+	}
 	for _, pattern := range patterns {
 		rel := strings.ReplaceAll(pattern, "{id}", id)
 		var target string
@@ -892,10 +898,35 @@ func decodeProjectDir(name string) string {
 	return "/" + strings.ReplaceAll(trimmed, "-", "/")
 }
 
+// shortIDFallback 是 shortID 在输入为空时的安全占位。
+//
+// 调用方拿 shortID 的返回值拼标题 / 键，空串会让多条会话塌成同一个键，
+// 所以这里宁可给一个明确可认的占位，也不返回 ""。
+const shortIDFallback = "unknown"
+
+// shortID 返回 id 的前 n 个 rune（不是前 n 个字节）。
+//
+// 会话 ID 来自文件名，可能含中文、emoji，甚至（在 Unix 上）非法 UTF-8 字节。
+// 按字节切 id[:n] 会把一个多字节 rune 劈成两半，产出非法 UTF-8：JSON 序列化
+// 时变成替换字符、map key 可能撞车。这里先转成 []rune 再切，转换本身会把
+// 非法字节逐个替换成 U+FFFD，因此返回值永远是合法 UTF-8。
+//
+// n < 1 时按 1 处理；id 为空时返回 shortIDFallback，绝不产出空串。
+func shortID(id string, n int) string {
+	if n < 1 {
+		n = 1
+	}
+	runes := []rune(id)
+	if len(runes) == 0 {
+		return shortIDFallback
+	}
+	if len(runes) > n {
+		runes = runes[:n]
+	}
+	return string(runes)
+}
+
 // fallbackTitle 在没有标题时给一个能认出来的名字。
 func fallbackTitle(id string) string {
-	if len(id) > 8 {
-		return "会话 " + id[:8]
-	}
-	return "会话 " + id
+	return "会话 " + shortID(id, 8)
 }
