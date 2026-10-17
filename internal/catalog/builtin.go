@@ -21,6 +21,22 @@ func dirStore(glob string) Store {
 	return Store{Kind: "dir", Glob: glob}
 }
 
+// zstdJSONLStore / zstdDirStore 是「正文整体是 zstd 压缩流」的 Store。
+//
+// 单独两个 helper 而不是给 jsonlStore/dirStore 加参数：绝大多数调用点没有
+// 压缩，多一个参数只会让它们都多写一个空串，反而更难读。
+func zstdJSONLStore(glob string, assoc ...string) Store {
+	store := jsonlStore(glob, assoc...)
+	store.Compress = "zstd"
+	return store
+}
+
+func zstdDirStore(glob string) Store {
+	store := dirStore(glob)
+	store.Compress = "zstd"
+	return store
+}
+
 func sqliteStore(db, table, id, title, timeCol, cwd string, rows ...string) Store {
 	return Store{
 		Kind: "sqlite", DB: db, Table: table,
@@ -361,12 +377,14 @@ func Builtin() []Spec {
 			Roots: []string{"~/.trae"}, Env: []string{"TRAE_HOME"},
 			Stores: []Store{
 				// rollout-*.jsonl 与 Codex 的 rollout 同构，标题解析可直接复用。
-				// 后缀 .jsonl.zst 的变体暂不支持：引擎还没有通用的解压路径。
 				jsonlStore("cli/sessions/**/rollout-*.jsonl"),
 				jsonlStore("cli/archived_sessions/**/rollout-*.jsonl"),
+				// 新版会写 .jsonl.zst（正文整体 zstd 压缩）。声明 Compress 后
+				// 扫描只解前 1MB 抽标题；删除仍是整文件删除，不需要解压。
+				zstdJSONLStore("cli/sessions/**/rollout-*.jsonl.zst"),
 			},
 			Indexs: []Index{jsonlIndex("cli/history.jsonl", "session_id")},
-			Note:   "与 Trae IDE 是两套数据；cli/ 下是 Codex rollout 同构的 JSONL。",
+			Note:   "与 Trae IDE 是两套数据；cli/ 下是 Codex rollout 同构的 JSONL（含 .jsonl.zst）。",
 		},
 		{
 			ID: "grok", Name: "Grok Build", Group: GroupCLI, Vendor: "xAI",
@@ -441,8 +459,11 @@ func Builtin() []Spec {
 			Stores: []Store{
 				jsonlStore("sessions/*.jsonl"),
 				jsonlStore("projects/*/sessions/*.jsonl"),
+				// 1.x 的正文是 sessions-v4/<id>/events.frames（zstd 帧）：按目录型
+				// 会话 + 整体压缩处理，扫描时优先读 events.frames。
+				zstdDirStore("sessions-v4/*"),
 			},
-			Note: "1.x 的 sessions-v4/*/events.frames 是 zstd 帧，当前扫不到。",
+			Note: "1.x 的 sessions-v4/*/events.frames 是 zstd 帧，已支持读取；更早版本是明文 JSONL。",
 		},
 		{
 			ID: "codewhale", Name: "CodeWhale", Group: GroupCLI, Vendor: "CodeWhale",

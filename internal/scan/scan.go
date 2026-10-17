@@ -453,13 +453,24 @@ func buildFileSession(spec catalog.Spec, home string, store catalog.Store, file 
 }
 
 func buildFileSessionWithNotices(spec catalog.Spec, home string, store catalog.Store, file string, info os.FileInfo, jsonl bool) (session.Session, []scanNotice) {
-	id := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+	base := filepath.Base(file)
+	// 压缩会话的文件名是 rollout-<uuid>.jsonl.zst：先去掉 .zst，再按普通规则
+	// 去掉 .jsonl，否则 ID 会变成「rollout-…jsonl」这种带扩展名的怪值。
+	if store.Compress == "zstd" && strings.HasSuffix(strings.ToLower(base), ".zst") {
+		base = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	id := strings.TrimSuffix(base, filepath.Ext(base))
 	// 文件名里带 uuid 的（Codex 的 rollout-…-<uuid>、Pi 的 <时间>_<uuid>）取 uuid 段：
 	// 前缀是时间戳，会随每次导出变化，不是稳定 id。
 	if match := uuidAtEnd.FindStringSubmatch(id); match != nil {
 		id = match[1]
 	}
-	meta := session.ReadMeta(file, jsonl)
+	var meta session.Meta
+	if store.Compress == "zstd" {
+		meta = session.ReadMetaZstdJSONL(file)
+	} else {
+		meta = session.ReadMeta(file, jsonl)
+	}
 
 	item := session.Session{
 		ID:       id,
@@ -561,7 +572,14 @@ func buildDirSession(spec catalog.Spec, home string, store catalog.Store, dir st
 	if match := uuidAtEnd.FindStringSubmatch(id); match != nil {
 		id = match[1]
 	}
-	meta := session.ReadMetaDir(dir)
+	var meta session.Meta
+	if store.Compress == "zstd" {
+		// 目录型压缩会话（Reasonix 1.x 的 events.frames）：正文不是一个
+		// 固定名的明文文件，而是目录里那份 zstd 流。
+		meta = session.ReadMetaZstdDir(dir)
+	} else {
+		meta = session.ReadMetaDir(dir)
+	}
 	title := meta.Title
 	project := meta.Project
 	updated := info.ModTime()

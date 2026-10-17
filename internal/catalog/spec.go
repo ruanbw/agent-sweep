@@ -78,6 +78,10 @@ type Store struct {
 	// Assoc 是与会话同名的旁挂目录/文件名（相对会话文件所在目录），
 	// 比如 Claude Code 的 `file-history/<id>`。删除时一起进废纸篓。
 	Assoc []string `json:"assoc,omitempty"`
+	// Compress 表示会话正文**整体**是压缩流，不是逐行压缩。目前只支持 "" 与
+	// "zstd"：扫描时只解前 1MB 左右抽元数据，删除仍是整文件/整目录删除，不需要
+	// 解压。TRAE CLI 的 rollout-*.jsonl.zst、Reasonix 1.x 的 events.frames 用它。
+	Compress string `json:"compress,omitempty"`
 }
 
 // Index 描述「删了正文之后还要裁掉的索引」。

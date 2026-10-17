@@ -144,26 +144,71 @@ func ReadMeta(path string, jsonl bool) Meta {
 	return meta
 }
 
-// ReadMetaZstd 从 zstd 压缩的 JSONL 里抽元数据（DeepSeek Harness 就是这么存的）。
+// zstd 解压的输入/输出上限。
 //
-// 解压是有上限的：只解前 1MB 压缩流、最多 512KB 明文。
-// 会话正文可能有几百 MB，为了一个标题把整份解压出来是不可接受的 ——
-// 而标题、cwd、时间戳都在头几行。
-func ReadMetaZstd(path string) Meta {
+// 会话正文可能有几百 MB，为了一个标题把整份解压出来不可接受 —— 标题、cwd、
+// 时间戳都在头几行。1MB 压缩流通常已是几十 MB 明文，远超抽标题所需。
+const (
+	zstdCompressedLimit = 1 << 20
+	zstdPlainLimit      = 1 << 20
+)
+
+// ReadMetaZstdJSONL 从一个「整体是 zstd 压缩流」的 JSONL 文件里抽元数据。
+//
+// TRAE CLI 的 rollout-*.jsonl.zst、DeepSeek Harness 的会话都是这种形态。
+// 解压有上限（压缩流与明文各 1MB），文件损坏/截断时返回空 Meta，不 panic：
+// 调用方是扫描主路径，一条坏文件不能拖垮整次扫描。
+func ReadMetaZstdJSONL(path string) Meta {
 	file, err := os.Open(path)
 	if err != nil {
 		return Meta{}
 	}
 	defer file.Close()
 
-	decoder, err := zstd.NewReader(io.LimitReader(file, 1<<20))
+	decoder, err := zstd.NewReader(io.LimitReader(file, zstdCompressedLimit))
 	if err != nil {
 		return Meta{}
 	}
 	defer decoder.Close()
 
-	head, _ := io.ReadAll(io.LimitReader(decoder, 512*1024))
+	head, _ := io.ReadAll(io.LimitReader(decoder, zstdPlainLimit))
 	return ParseJSONL(head)
+}
+
+// ReadMetaZstd 保留旧入口，语义等同 ReadMetaZstdJSONL。
+//
+// 目录型会话的固定文件名（session.v4.jsonl.zstd 等）走这里；Store 声明了
+// Compress 的路径走 ReadMetaZstdJSONL，两者共用同一套解压限制。
+func ReadMetaZstd(path string) Meta { return ReadMetaZstdJSONL(path) }
+
+// ReadMetaZstdDir 处理「目录即会话、正文整体是 zstd 压缩流」的目录。
+//
+// 优先 events.frames（Reasonix 1.x 的固定文件名），否则取目录里第一个非隐藏
+// 普通文件；隐藏文件与子目录都不参与 —— 它们多半是锁、缓存或旁挂产物。
+// 解出的小段明文按 JSONL 解析；解不出或损坏返回空 Meta。
+func ReadMetaZstdDir(dir string) Meta {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return Meta{}
+	}
+	target := ""
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if entry.Name() == "events.frames" {
+			target = path
+			break
+		}
+		if target == "" {
+			target = path
+		}
+	}
+	if target == "" {
+		return Meta{}
+	}
+	return ReadMetaZstdJSONL(target)
 }
 
 // ReadMetaDir 在一个「目录即会话」的目录里找可读元数据：

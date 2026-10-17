@@ -56,6 +56,13 @@ func TestBuiltinEntriesAreWellFormed(t *testing.T) {
 			default:
 				t.Errorf("%s: 未知 Store 形态 %q", spec.ID, store.Kind)
 			}
+			// 压缩格式是 Store 的「正文整体怎么编码」声明；写错值会让扫描按
+			// 错误方式读正文（静默抽出空标题），所以在目录层就挡掉。
+			switch store.Compress {
+			case "", "zstd":
+			default:
+				t.Errorf("%s: 未知压缩格式 %q（目前只支持空串或 zstd）", spec.ID, store.Compress)
+			}
 		}
 	}
 }
