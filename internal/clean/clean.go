@@ -354,12 +354,29 @@ func sortedKeys(set map[string]bool) []string {
 	return out
 }
 
-// checkPathInHome 是删除路径的硬护栏。
+// checkPathInHome 是删除路径的硬护栏，分两层。
 //
 // 会话 Paths 来自扫描结果，理论上都在数据根下；但自定义适配器、被改过的清单、
-// 甚至上游解析 bug 都可能塞进 `../../Documents`。这里只看词法上的 Rel 结果，
-// 不跟符号链接：删除一个指向外部的链接本身只动链接，不会顺着它删目标。
+// 甚至上游解析 bug 都可能塞进 `../../Documents`。第一层只看词法上的 Rel 结果，
+// 挡住这种显式逃逸。
+//
+// 第二层在真正解析文件系统之后再判一次：词法上 `home/projects/s1.jsonl` 确实在
+// home 内，但如果 `home/projects` 是指到外部的符号链接，os.RemoveAll / moveToTrash
+// 会由内核顺着它落到数据根之外。真实路径校验只解析 home 与目标路径的父目录，
+// 最后一段故意不解析 —— 删除一个指向外部的链接本身只动链接，不跟目标，所以
+// 「最后一段是 symlink」仍然允许。
 func checkPathInHome(home, path string) error {
+	if err := checkPathInHomeLexical(home, path); err != nil {
+		return err
+	}
+	return checkPathInHomeReal(home, path)
+}
+
+// checkPathInHomeLexical 是只做字符串运算的包含性判断。
+//
+// 它单独成函数，是因为真实路径层依赖文件系统现状，而这一层在路径不存在时仍然
+// 要给出结论，两者失败模式不同，测试也需要分开覆盖。
+func checkPathInHomeLexical(home, path string) error {
 	if strings.TrimSpace(path) == "" {
 		return errors.New("拒绝删除空路径")
 	}
@@ -377,6 +394,49 @@ func checkPathInHome(home, path string) error {
 		// Rel 为 "." 意味着用户选中了数据根本身。这不是「一条会话」，
 		// 删除它等于把整个 Agent 抹掉，必须拦住。
 		return fmt.Errorf("拒绝删除数据根本身: %s", path)
+	}
+	return nil
+}
+
+// checkPathInHomeReal 用解析掉符号链接后的真实路径再做一次包含性判断。
+//
+// 先 EvalSymlinks(home)，再 EvalSymlinks(待删路径的父目录)，最后把原 basename
+// 拼回去：父目录的中间层 symlink 会被展开，而最后一段保持原样，所以删链接本身
+// 依旧安全。
+//
+// EvalSymlinks 对不存在的路径会返回错误，而「删除前路径已经不存在」是正常情况
+// （用户可能刚手动清过，或上一步已删掉），此时应退回词法层的结论，不能把
+// 「不存在」当成越界报错。home 本身不存在同理。
+func checkPathInHomeReal(home, path string) error {
+	if strings.TrimSpace(home) == "" {
+		// 词法层已经覆盖了空 home 的行为，这里不再重复判断。
+		return nil
+	}
+	realHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("数据根 %s 的真实路径解析失败: %w", home, err)
+	}
+
+	clean := filepath.Clean(path)
+	realParent, err := filepath.EvalSymlinks(filepath.Dir(clean))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("路径 %s 的真实父目录解析失败: %w", path, err)
+	}
+	target := filepath.Join(realParent, filepath.Base(clean))
+
+	rel, err := filepath.Rel(realHome, target)
+	if err != nil {
+		return fmt.Errorf("路径 %s 无法相对数据根 %s 计算: %w", path, home, err)
+	}
+	if filepath.IsAbs(rel) ||
+		rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("拒绝删除数据根之外的路径（符号链接解析后为 %s）: %s", target, path)
 	}
 	return nil
 }
