@@ -259,10 +259,15 @@ func Builtin() []Spec {
 				// <session-id>.file-rollback.ndjson 是文件回滚日志 —— 三者同删。
 				// 早先声明的 conversations/* 与 sessions/*.json 在这些版本里都不存在。
 				jsonlStore("projects/*/*.jsonl", "{id}", "{id}.file-rollback.ndjson"),
-				// 会话索引：标题、状态、创建/更新时间都在这张表里。
-				sqliteStore("workbuddy.db", "sessions", "id", "title", "updated_at", "cwd"),
 			},
-			Note: "正文是 projects/<项目>/<会话>.jsonl；workbuddy.db 里另有一份会话索引，删除会一并裁掉。",
+			// 会话索引：标题、状态、创建/更新时间都在这张表里。
+			//
+			// 必须是 Index 而不是 Store：Store 只参与扫描，删正文之后没人会
+			// 回头裁这张表，下一轮扫描它又作为一条「会话」冒出来 —— 用户得删
+			// 两次，第二次删的还是没有正文的空壳。Index 才会在删除流程里按
+			// 已删 ID 裁行，并与正文删除一起进 journal 供撤销。
+			Indexs: []Index{sqliteIndex("workbuddy.db", "sessions", "id")},
+			Note:   "正文是 projects/<项目>/<会话>.jsonl；workbuddy.db 里另有一份会话索引，删除会一并裁掉。",
 		},
 		{
 			// 同一款 IDE 的稳定版 / 预览版 / 国内版数据目录是并列的，
