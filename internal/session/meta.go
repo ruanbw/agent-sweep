@@ -249,11 +249,13 @@ func (m *Meta) merge(obj map[string]any) {
 		}
 	}
 
-	if role == "user" || role == "assistant" {
-		m.Messages++
-	}
-	// 有些 Agent 用 type 而不是 role 标消息。
-	if typ, _ := obj["type"].(string); typ == "user" || typ == "assistant" {
+	// 消息计数：role 和 type 是同一件事的两种标法，**一条记录最多计一条**。
+	// Claude Code 的形态是 {"type":"user","message":{"role":"user",…}}，
+	// 两个字段同时命中；早先两个 if 各自 ++ 会把消息数翻倍。
+	// 也不能只留 type：有的 Agent（Pi / Gemini CLI 一类）只有 type 没有 role，
+	// 反过来也有只写 role 的。
+	typ, _ := obj["type"].(string)
+	if isChatMessage(role) || isChatMessage(typ) {
 		m.Messages++
 	}
 
@@ -329,6 +331,15 @@ func deepUserText(value any, depth int) string {
 		}
 	}
 	return ""
+}
+
+// isChatMessage 判断一个 role / type 取值是否代表一条对话消息。
+//
+// 只认 user / assistant：system、tool、summary、message、session 等
+// 是提示词、工具输出或容器/元信息，计进消息数会让「这条会话有多大」
+// 虚高，而用户是拿这个数字判断删不删的。
+func isChatMessage(v string) bool {
+	return v == "user" || v == "assistant"
 }
 
 func roleOf(obj map[string]any) string {
