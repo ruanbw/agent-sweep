@@ -93,8 +93,12 @@ func Builtin() []Spec {
 		},
 		{
 			ID: "qwen-code", Name: "Qwen Code", Group: GroupCLI, Vendor: "Alibaba",
-			Roots:  []string{"~/.qwen"},
-			Stores: []Store{jsonStore("tmp/*/chats/*.json")},
+			Roots: []string{"~/.qwen"},
+			Stores: []Store{
+				jsonStore("tmp/*/chats/*.json"),
+				// 较新布局把同样的会话写成 JSONL（registry 观测，未实机验证）。
+				jsonlStore("projects/*/chats/*.jsonl"),
+			},
 		},
 		{
 			ID: "opencode", Name: "OpenCode", Group: GroupCLI, Vendor: "SST",
@@ -151,6 +155,8 @@ func Builtin() []Spec {
 				"~/Library/Application Support/Cursor/User/globalStorage/rooveterinaryinc.roo-cline",
 			},
 			Stores: []Store{dirStore("tasks/*")},
+			// 上游仓库已于 2026-05 归档（archived），不再收新会话形态。
+			Note: "会话在 tasks/<id>/ 下；上游仓库已 archived，本条目只做存量清理。",
 		},
 		{
 			ID: "kilo-code", Name: "Kilo Code", Group: GroupExtension, Vendor: "Kilo",
@@ -353,8 +359,14 @@ func Builtin() []Spec {
 		},
 		{
 			ID: "kimi-cli", Name: "Kimi CLI", Group: GroupCLI, Vendor: "Moonshot",
-			Roots:  []string{"~/.kimi", "~/.moonshot"},
-			Stores: []Store{jsonStore("sessions/*.json"), jsonlStore("sessions/*.jsonl")},
+			// 新旧两代布局：`.kimi/.moonshot` 是旧版扁平 sessions/，`.kimi-code` 是
+			// 新版 <session>/<run>/agents/main/wire.jsonl。根不同所以并列候选。
+			Roots: []string{"~/.kimi-code", "~/.kimi", "~/.moonshot"},
+			Stores: []Store{
+				jsonlStore("sessions/*/*/agents/main/wire.jsonl"),
+				jsonStore("sessions/*.json"),
+				jsonlStore("sessions/*.jsonl"),
+			},
 		},
 		{
 			ID: "iflow", Name: "iFlow CLI", Group: GroupCLI, Vendor: "iFlow",
@@ -513,8 +525,9 @@ func Builtin() []Spec {
 			Stores: []Store{
 				jsonlStore("projects/**/agent-transcripts/**/*.jsonl"),
 			},
-			// chats/*/*/store.db 也是会话库，但一个会话一个库（DB 目前不支持 glob）。
-			Note: "与 Cursor IDE 是两套数据；chats/*/*/store.db 暂时扫不到，只能清 transcript。",
+			// chats/*/*/store.db 也是会话库（一个会话一个库）。DB glob 已支持，
+			// 但会话表名/列名尚未实机核实，暂时只收 transcript，避免误声明。
+			Note: "与 Cursor IDE 是两套数据；chats/*/*/store.db 已支持多库扫描，表名待实测后接入，当前只清 transcript。",
 		},
 		{
 			ID: "cline-cli", Name: "Cline CLI", Group: GroupCLI, Vendor: "Cline",
@@ -595,6 +608,121 @@ func Builtin() []Spec {
 			Bundles: []string{"Jan.app"},
 			Roots:   []string{"~/Library/Application Support/Jan", "~/.config/Jan"},
 			Stores:  []Store{jsonStore("data/threads/*.json")},
+		},
+
+		// —— 2026-10 调研补充（未在本机逐条实测的都在 Note 里标明）——
+		//
+		// 证据分级：本机实测 > 官方文档/上游源码 > 社区实测帖。凡是没有实机
+		// schema 的表名/列名，只给最保守的形态并在 Note 里写清「未验证」，
+		// 不猜多张子表。
+		{
+			ID: "lingma", Name: "通义灵码 / Lingma", Group: GroupExtension, Vendor: "Alibaba",
+			Roots: []string{"~/.lingma"},
+			Stores: []Store{
+				// 一轮问答一个 jsonl；assets/ 是旁挂产物，会话目录本身一起进废纸篓。
+				jsonlStore("cache/projects/*/conversation-history/*/*.jsonl", "{id}"),
+			},
+			// 索引 cache/db/local.db 的表名/列名来自社区实测帖但没有本机 schema，
+			// 不猜；删正文后灵码 UI 可能仍显示条目，写在 Note 里比猜错安全。
+			Note: "正文是会话 jsonl；索引 cache/db/local.db 的表名未核实，当前版本不裁索引，删完可能仍显示条目。路径来自社区实测帖，未实机验证。",
+		},
+		{
+			ID: "claude-desktop-3p", Name: "Claude Desktop (3P)", Group: GroupApp, Vendor: "Anthropic",
+			Bundles: []string{"Claude.app"},
+			Roots:   []string{"~/Library/Application Support/Claude-3p"},
+			Stores: []Store{
+				// local-agent-mode-sessions/<account>/<org>/<session>/：一个目录一条会话，
+				// uploads/、outputs/、audit.jsonl 都在目录里，天然一起进废纸篓。
+				dirStore("local-agent-mode-sessions/*/*/*"),
+			},
+			Note: "3P/本地 Agent 模式，会话只存本机；标准版 Claude Desktop 是纯云端、没有本地正文，所以单独一条。路径来自官方文档，未实机验证。",
+		},
+		{
+			ID: "freebuff-desktop", Name: "Freebuff Desktop", Group: GroupApp, Vendor: "Codebuff",
+			Roots: []string{"~/.config/freebuff-desktop"},
+			Stores: []Store{
+				// 每个项目一个库（DB glob）；threads 是会话，messages 通过 thread_id 挂靠。
+				// schema 已在本机只读实测（threads/messages 两表与列名）。
+				sqliteStore("projects/*/desktop-v2.db", "threads", "id", "title", "last_prompt_at", "project_path",
+					"messages:thread_id"),
+			},
+			Note: "每个项目一个 desktop-v2.db（DB glob）；schema 本机实测，库内可能还没有会话。",
+		},
+		{
+			ID: "codebuff-cli", Name: "Codebuff CLI", Group: GroupCLI, Vendor: "Codebuff",
+			Roots: []string{"~/.config/manicode"},
+			Stores: []Store{
+				// projects/<project>/chats/<ts>/ 里是 chat-messages.json + run-state.json。
+				dirStore("projects/*/chats/*"),
+			},
+			Note: "一个目录一条会话，目录内有 chat-messages.json/run-state.json。路径来自上游源码，未实机验证。",
+		},
+		{
+			ID: "kilo-cli", Name: "Kilo Code CLI", Group: GroupCLI, Vendor: "Kilo",
+			Roots: []string{"~/.local/share/kilo"},
+			Stores: []Store{
+				// 与 opencode 同 schema：session 主表。暂不声明子表，等实机确认。
+				sqliteStore("kilo.db", "session", "id", "title", "time_updated", "directory"),
+			},
+			Note: "与 opencode 同族的 SQLite schema；消息子表未在本机核实，当前只删主表行。路径来自独立解析器，未实机验证。",
+		},
+		{
+			ID: "factory-droid", Name: "Factory Droid", Group: GroupCLI, Vendor: "Factory AI",
+			Roots: []string{"~/.factory"},
+			Stores: []Store{
+				// 已证实 sessions/<uuid>.settings.json 存在；transcript 本体文件名未证实，
+				// 先按 settings 文件建一条会话，后续实测再补。
+				jsonStore("sessions/*.settings.json"),
+			},
+			Note: "sessions/<uuid>.settings.json 已证实；transcript 文件名待实测，当前可能只看到元数据。路径来自上游路径表，未实机验证。",
+		},
+		{
+			ID: "msty", Name: "Msty", Group: GroupApp, Vendor: "CloudStack",
+			Bundles: []string{"Msty.app"},
+			Roots:   []string{"~/Library/Application Support/Msty", "~/.msty"},
+			Stores: []Store{
+				// 多 workspace 每个一个 msty.db（DB glob）。会话表名只证实到
+				// chat_session_folders（官方校验脚本用），真正的 session 表未实测；
+				// 这里不猜五张表，只声明最可能的一张并标明未验证。
+				sqliteStore("**/msty.db", "chat_sessions", "id", "title", "updated_at", ""),
+			},
+			Note: "每个 workspace 一个 msty.db（DB glob）；会话表名未实测（调研只证实 chat_session_folders 存在），当前版本可能扫不到。",
+		},
+		{
+			ID: "hermes", Name: "Hermes", Group: GroupCLI, Vendor: "Hermes",
+			Roots: []string{"~/.hermes"},
+			Stores: []Store{
+				// 调研只给到「state.db / profiles/*/state.db」两个库位置，表名未证实。
+				sqliteStore("state.db", "sessions", "id", "title", "updated_at", ""),
+				sqliteStore("profiles/*/state.db", "sessions", "id", "title", "updated_at", ""),
+			},
+			Note: "库位置来自独立解析器，会话表名/列名未实测；表名不对时会显示扫描错误（不会误删），待实机 schema 后修正。",
+		},
+		{
+			ID: "positron", Name: "Positron Assistant", Group: GroupIDE, Vendor: "Posit",
+			Bundles: []string{"Positron.app"},
+			Roots:   []string{"~/Library/Application Support/Positron/User"},
+			Stores:  []Store{jsonStore("workspaceStorage/*/chatSessions/*.json")},
+			// 与 vscode 同构：state.vscdb 的索引键名未识别，先登记空索引占位。
+			Indexs: []Index{sqliteIndex("globalStorage/state.vscdb", "", "")},
+			Note:   "VS Code fork，会话在 workspaceStorage/chatSessions；state.vscdb 里的索引键名未核实，删除时暂不裁。路径来自社区讨论，未实机验证。",
+		},
+		{
+			ID: "open-webui", Name: "Open WebUI", Group: GroupApp, Vendor: "Open WebUI",
+			Roots: []string{"~/open-webui/data", "~/.open-webui/data"},
+			Stores: []Store{
+				sqliteStore("webui.db", "chat", "id", "title", "updated_at", ""),
+			},
+			Note: "自托管服务，数据目录可用 DATA_DIR 改写；表结构来自官方文档，未实机验证。",
+		},
+		{
+			ID: "minimax-code", Name: "MiniMax Code", Group: GroupCLI, Vendor: "MiniMax",
+			Roots: []string{"~/.minimax"},
+			Stores: []Store{
+				// 库位置来自独立解析器，表名未证实；不猜子表。
+				sqliteStore("v2/sqlite/runtime-state.sqlite", "sessions", "id", "title", "updated_at", ""),
+			},
+			Note: "库路径来自独立解析器（可用 MINIMAX_DATA_DIR 覆盖），会话表名未实测；表名不对时会显示扫描错误，待实机 schema 后修正。",
 		},
 	}
 }
