@@ -127,6 +127,10 @@ func (c *Cleaner) trimSharedIndexDB(
 		return
 	}
 
+	// 与 deleteSQLiteSessions 同一口径：动库之前记录主库 + WAL + SHM 的足迹，
+	// VACUUM 并关库之后再算差。
+	before := sqliteFootprint(dbPath)
+
 	// 先记账、后裁剪：预写命中的表与 URI 并落盘，再逐表删。崩溃窗口里账本
 	// 已经带着这个库的备份与计划。
 	planned := make([]journalRow, 0, len(matched))
@@ -183,14 +187,13 @@ func (c *Cleaner) trimSharedIndexDB(
 		db.Close()
 		return
 	}
-	before := fileSize(dbPath)
 	if _, err := db.Exec("VACUUM"); err != nil {
 		res.Errors = append(res.Errors, ItemError{
 			Message: fmt.Sprintf("VACUUM 共享索引 %s 失败: %v", dbPath, err),
 		})
 	}
 	db.Close()
-	if freed := before - fileSize(dbPath); freed > 0 {
+	if freed := freedFromFootprint(before, sqliteFootprint(dbPath)); freed > 0 {
 		res.Freed += freed
 	}
 }

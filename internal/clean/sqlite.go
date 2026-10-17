@@ -570,6 +570,10 @@ func (c *Cleaner) trimSQLiteIndex(
 		return
 	}
 
+	// 与 deleteSQLiteSessions 同一口径：在动库之前记录「主库 + WAL + SHM」的
+	// 足迹，VACUUM 并关库之后再算差；只看主库会把 WAL 的变化算漏。
+	before := sqliteFootprint(dbPath)
+
 	// 先记账、后裁剪：预写「这个库的这张表将删这些 ID」并落盘，再动库。
 	planned := []journalRow{{Table: idx.Table, IDs: append([]string(nil), ids...)}}
 	j.SQLite = append(j.SQLite, journalDB{DB: dbPath, Backup: backup, Deletes: planned})
@@ -628,13 +632,12 @@ func (c *Cleaner) trimSQLiteIndex(
 		return
 	}
 
-	before := fileSize(dbPath)
 	vacuumErr := error(nil)
 	if _, err := db.Exec("VACUUM"); err != nil {
 		vacuumErr = err
 	}
 	db.Close()
-	if freed := before - fileSize(dbPath); freed > 0 {
+	if freed := freedFromFootprint(before, sqliteFootprint(dbPath)); freed > 0 {
 		res.Freed += freed
 	}
 	if vacuumErr != nil {

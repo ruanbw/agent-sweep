@@ -178,90 +178,96 @@ journal 是磁盘上一份**可以被改写**的 JSON（当前用户的权限、
 结构性改造，要么收益与复杂度不匹配。写在这里是为了让后来者知道现状与闭合路径，
 而不是把「没修」当成「已修」。
 
-### 删除路径的 TOCTOU 窗口
+上一版里列的删除路径 TOCTOU、只信 Paths、journal 动作后记账、glob 单层宽度、
+符号链接体积口径、Freed/Count 口径已经在本轮闭合或写进代码注释，不再作为风险
+列出（见本节末尾一句小结）。
 
-`checkPathInHome` 的 realpath 校验（见「路径必须在数据根内」）与真正
-`os.RemoveAll` / `moveToTrash` 之间还有一个时间窗口。Agent 并发写盘时，可以把
-刚校验过的目录换成指向数据根之外的符号链接，让删除作用到校验时还不存在的位置。
-窗口很小，但确实存在。
+### 撤销路径仍未 fd 化
 
-没有在本轮改，是因为彻底闭合需要「基于目录文件描述符的相对删除」：
-从数据根开始逐段 `openat(O_NOFOLLOW|O_DIRECTORY)` 打开父目录，再用相对名字
-`unlinkat` 删除。Go 标准库没有直接对应物，等于把 `deleteFileSession` /
-`trashFileSession` 整条链改造成 fd 相对操作，属于结构性改造而不是补一个检查。
-真要闭合，还需要配套的「中间层变成链接即失败」测试。
+风险：`Undo` 仍用 `movePath` 按路径把正文从废纸篓搬回 `journal.Orig`。journal
+是磁盘上一份可被改写的 JSON，废纸篓里的副本也可能被替换；虽然撤销前会重放
+`checkPathInHome`，但「校验到搬回」之间仍是路径解析。
 
-### 删除只信任 `session.Paths`
+为什么仍在：这条路径面对的是**本批次私有的废纸篓目录 + 我们写出的 journal**，
+威胁模型与「Agent 并发改写数据根」不同；`fsx.RenameUnder` 目前是「源在数据根、
+目标目录由调用方给出」的单根形状，而撤销需要「源在 trash、目标在 home」的双根
+变体，属于新原语而不是补一个参数。
 
-`deleteFileSession` / `deleteSidecars` 不重新展开 `store.Glob`，只按扫描产出的
-`Paths` 动作。现有护栏是「路径必须在数据根内」，以及旁挂路径在扫描侧由
-`applyAssoc` 做词法包含性检查、在删除侧由 `deleteSidecars` 再跑一次
-`checkPathInHome`（真实路径层），所以不会删到数据根之外。
+闭合：给 fsx 增加双根版本（两端都从目录 fd 出发，源侧用 `O_NOFOLLOW` 逐层
+`openat`，目标侧同样校验父目录），撤销时调用；配套「journal 里的 Orig 被换成
+链接」「trash 副本被换链」两类测试。
 
-残余风险在于语义错配：扫描之后如果适配器声明被改（用户保存了新的自定义适配器、
-指纹建议覆盖了旧条目），删除依据的仍是旧扫描结果，可能删掉「按新声明已经不属于
-这款 Agent」的文件。要防这一点，必须在删除时用同一份声明重放 glob 并与 `Paths`
-求交；成本高，而且无法区分「用户改了声明」与「Agent 自己搬了文件」，所以本轮
-不做。
+### rename 目标存在性检查与 renameat 之间
 
-### 释放量是近似值
+风险：`RenameUnder` 先 `Fstatat` 确认目标不存在，再 `renameat`；两步之间如果
+出现同名文件，`renameat` 会静默覆盖。
 
-「已释放」不是精确值，也不是严格下界：
+为什么仍在：目标目录是本批次 `0700` 的废纸篓目录，同用户攻击者不在威胁模型
+内；跨用户/跨进程写不进这个目录。窗口只在「我们自己连续两次写入同名」时才有
+意义，而命名避让已经处理了那条路径。
 
-- 文件型在 `deleteFileSession` 里取 `fsx.Size` 的瞬时值，再 `RemoveAll`；两个
-  采样点之间 Agent 还在写文件时，数字会偏大或偏小。
-- SQLite 型按 VACUUM 前后 `fileSize` 的差计算；并发写入同样会让差值偏离真实
-  收缩量。负数已经被 `if freed > 0` 挡掉。
-- `trash` 模式本来就不计释放量（只是挪位置），这一点在「两种删除模式」里写过。
+闭合：renameat 没有「不覆盖」原语。要么用临时名 + `link`/`unlink` 的两阶段，
+要么用 `renameat2(RENAME_NOREPLACE)`（macOS 没有）。收益有限，暂不做。
 
-精确统计需要文件系统级的块/配额信息，跨平台不可行。UI 文案应始终把它读作
-「约」而不是承诺；如果以后要更准，可以在删除结束后对目标目录做一次实际统计，
-而不是继续在采样点上加逻辑。
+### SQLite 释放量是估算
 
-### journal 与最后一个动作之间的窗口
+风险：`Freed` 是「动作前后足迹差」（主库 + `-wal` + `-shm`）的估算。采样点之间
+Agent 可能同时在写库，数字可能偏大或偏小；`trash` 模式只挪位置，不计释放量。
 
-journal 是「先动作、后记账」：每成功 `RemoveAll` / `moveToTrash` / 提交 SQLite
-删除之后，才调用 `journal` 的持久化。进程恰好在这两步之间被 kill 时，磁盘上的
-最后一次账本会缺这一条 —— SQLite 备份已经生成却没有人引用它，变成孤儿备份；
-批次可撤销的范围也就少一条。
+为什么仍在：精确统计需要文件系统块级/配额信息，跨平台不可行；删除是低频操作，
+用户需要的只是量级。
 
-消除它需要两阶段提交：先写「准备执行」、再执行、最后写「完成」，启动时对账。
-这会显著增加删除延迟与实现复杂度，所以本轮只保留「每完成一步就落盘」的现状。
-真要闭合，建议在 journal 里增加 pending 状态，并在 `Cleaner` 初始化时对
-pending 条目做一次磁盘状态对账（补齐或清理孤儿备份）。
+现状：`deleteSQLiteSessions`、`trimSQLiteIndex`、`shared_index.go` 三处已统一走
+`sqliteFootprint` + `freedFromFootprint`（只报正数）。UI 文案应始终读作「约」。
 
-### permanent 部分成功时 Freed 与 Count 的口径不同
+### agent-host.db 的按会话 metadata 键未清理
 
-`deleteFileSession` 在 permanent 模式下按**路径**累加 `Freed`，但只有整条会话的
-所有路径都删成功才让调用方 `Count++`。部分成功时两个数字表达的是不同口径：
-`Freed` 已经包含删掉的那部分路径，`Count` 却不计这条会话。单独看都合理，但把
-它们当同一维度读会困惑。
+风险：`agent-host.db` 的 `metadata` 表里有
+`sessionsV2Excluded:copilotcli:...:/<uuid>`、`sessionsV2PayloadBackfilled:...`
+这类**按会话**的键。删 claude-code / copilot-cli 时只裁
+`session_chats` / `session_chat_catalogs` / `sessions_v2` / `sessions`，这些键
+会留下。属残留状态，不影响会话列表，但会让「已删会话」的排除/回填标记留在库
+里。
 
-本轮不改口径：要么牺牲「已释放」的即时反馈，要么把计数拆成两条。真要细化，建议
-在结果里区分「已删除会话数」与「已删除路径数」，UI 分开呈现。
+为什么仍在：这些键的格式（provider 段重复、URI 形态）没有一手文档；按前缀模糊
+删可能误伤 `sessionRegistryBackfilled:claude` 这类全局开关。
 
-### 符号链接体积
+闭合：拿到 VS Code 源码或稳定的 metadata 键规范后，按精确前缀清理，并把清理
+动作并入 shared index 的 journal（可撤销）。
 
-`fsx.Size` 用 `Lstat`，只累加目录与普通文件，符号链接一律按 0；
-`os.RemoveAll` 也只删链接本身，不跟随目标。这是刻意的安全取舍：跟随链接会让
-「预计释放」虚高，删除时又绝不该碰数据根外的目标。
+### state.vscdb 系索引未裁
 
-代价是数字会偏小：如果 Agent 把会话内容通过链接指向外部，
-`fsx.Size` 不会把目标大小算进来，实际删除也只回收链接本身。要改善只能改展示，
-不能改删除语义 —— 例如在 UI 上标注「链接目标未计入」，或单独统计符号链接数量。
+风险：`vscode` / `cursor` / `windsurf` / `positron` 等条目把
+`globalStorage/state.vscdb` 登记为索引，但表名/键名未核实；`trimIndexes` 遇到
+空 Table/IDCol 会跳过。删正文后，旧版 UI 的索引里可能留空条目（幽灵会话）。
 
-### glob 单层宽度没有预算
+为什么仍在：VS Code 系把会话存在 `state.vscdb` 的 ItemTable key-value 里，键名
+随版本变化，猜错会整表重写。
 
-`GlobBounded` 的预算按「产出结果条数 + `**` 递归深度」计。一个一条都不匹配、
-但每层目录都超宽的 glob（例如 `**/nomatch/*.x`）仍可能对单个超大目录做一次全量
-`ReadDir` —— 深度预算管不到同一层的宽度。
+闭合：实测各版本的 key 名后，为索引增加「key-value 形态」（不是表列）或在 scan
+层识别；`cursor`/`windsurf` 的正文是否在 `state.vscdb` 也需要复核。
 
-本轮只覆盖了「匹配很多」的放量场景。要彻底封顶，需要给 `GlobBounded` 增加
-「访问目录项数」预算（在每次 `ReadDir` 后累计，超限即置 truncated 并返回），
-并把预算值接到 `scan` 的调用点上。这会改函数签名与全部调用点，留待后续。
+### 新收条目的推断表名
 
-以上相邻但**已经闭合**的项不在本节重列：旁挂路径越界拦截、撤销顺序（先正文后
-索引）、SQLite 表/列真实性校验、数据根本身可信性校验、单个 Agent panic 隔离。
+风险：`msty` / `hermes` / `minimax-code` 的会话表名没有实机 schema（调研只给到
+库路径）。真机上可能只显示扫描错误、扫不到会话；不会误删（没有扫到就没有可删
+的行）。
+
+为什么仍在：缺的是实机证据，不是代码能力。
+
+闭合：拿到实机 schema 后修正 Table/列名，并移除 Note 里的「未验证」提示。
+
+### 形态不支持的格式
+
+XML、IndexedDB 单体、加密 protobuf、聚合 markdown 等格式不在现有四种 Store
+形态内（JetBrains AI Assistant、Cherry Studio/Chatbox、Void、Windsurf Cascade、
+Aider 等）。逐条线索与下一步需要的证据在
+[`docs/adding-agents.md`](adding-agents.md) 的「已调研但暂不能收录」一节，这里
+不重复展开。
+
+本轮闭合的相邻项（不在此节重列）：删除路径 TOCTOU（fd 相对 `RemoveAllUnder` /
+`RenameUnder`）、删除重放 Store/Assoc 声明（含 sidecar）、journal 改为动作前
+落盘、glob 增加访问条目预算、符号链接体积口径、Freed/Count 口径注释。
 
 ## 报告问题
 

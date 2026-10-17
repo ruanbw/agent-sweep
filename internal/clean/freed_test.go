@@ -169,3 +169,93 @@ func TestPermanentPartialFailureAccounting(t *testing.T) {
 		t.Fatalf("失败路径对应的真实文件不该被删: %s", bad)
 	}
 }
+
+// TestIndexTrimFreedUsesFootprint 确认 SQLite 索引裁剪也用同一套足迹记账：
+// 删掉大块索引行后 VACUUM 缩库应计入 Freed。
+func TestIndexTrimFreedUsesFootprint(t *testing.T) {
+	f := newFixture(t, ModePermanent)
+	idxPath := filepath.Join(f.home, "index.db")
+	db, err := sql.Open("sqlite", "file:"+idxPath)
+	if err != nil {
+		t.Fatalf("open index: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE rows (id TEXT, body TEXT)`); err != nil {
+		db.Close()
+		t.Fatalf("create: %v", err)
+	}
+	payload := strings.Repeat("x", 1024)
+	for i := 0; i < 2000; i++ {
+		if _, err := db.Exec(`INSERT INTO rows (id, body) VALUES ('s1', ?)`, payload); err != nil {
+			db.Close()
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	db.Close()
+
+	body := filepath.Join(f.home, "sessions", "s1.jsonl")
+	writeTestFile(t, body, "body")
+	spec := catalog.Spec{
+		ID:     "demo",
+		Stores: []catalog.Store{{Kind: "jsonl", Glob: "sessions/*.jsonl"}},
+		Indexs: []catalog.Index{{Kind: "sqlite-rows", DB: "index.db", Table: "rows", IDCol: "id"}},
+	}
+	res, err := f.cleaner.Delete(spec, f.home, []session.Session{fileSession("s1", body)})
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(res.Errors) != 0 {
+		t.Fatalf("删除不该报错: %+v", res.Errors)
+	}
+	if res.Freed < 0 {
+		t.Fatalf("Freed = %d，不能为负", res.Freed)
+	}
+	if res.Freed < 100_000 {
+		t.Fatalf("删掉约 2MB 索引行后 Freed 只报了 %d，足迹记账可能没生效", res.Freed)
+	}
+}
+
+// TestSharedIndexFreedUsesFootprint 确认共享索引（agent-host.db）的释放量同样
+// 走 sqliteFootprint：删掉大 payload 行后 VACUUM 缩库应计入 Freed。
+func TestSharedIndexFreedUsesFootprint(t *testing.T) {
+	f := newFixture(t, ModePermanent)
+	hostHome := t.TempDir()
+	dbPath := filepath.Join(hostHome, "globalStorage", "agent-host.db")
+	const sessionID = "freed-1"
+	makeSharedIndexDB(t, dbPath, sessionID)
+	useSharedHostHome(t, hostHome)
+
+	// 给目标会话塞一个 1MB 的 sessions_v2 payload，让 VACUUM 有东西可缩。
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open host db: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE sessions_v2 SET payload = ? WHERE session_uri = ?`,
+		strings.Repeat("y", 1<<20), "vscode-chat://claude-code/"+sessionID); err != nil {
+		db.Close()
+		t.Fatalf("update payload: %v", err)
+	}
+	db.Close()
+
+	spec, ok := catalog.Find("claude-code")
+	if !ok {
+		t.Fatal("内置目录里没有 claude-code")
+	}
+	body := filepath.Join(f.home, "sessions", sessionID+".jsonl")
+	writeTestFile(t, body, "body")
+	res, err := f.cleaner.Delete(spec, f.home, []session.Session{{
+		ID: sessionID, UID: spec.ID + ":" + sessionID, AgentID: spec.ID,
+		Storage: session.StorageFile, Paths: []string{body},
+	}})
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(res.Errors) != 0 {
+		t.Fatalf("删除不该报错: %+v", res.Errors)
+	}
+	if res.Freed < 0 {
+		t.Fatalf("Freed = %d，不能为负", res.Freed)
+	}
+	if res.Freed < 100_000 {
+		t.Fatalf("删掉 1MB payload 后 Freed 只报了 %d，足迹记账可能没生效", res.Freed)
+	}
+}
