@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
@@ -47,13 +48,24 @@ func staticHandler() http.Handler {
 }
 
 // Serve 只起 HTTP 服务，不开窗口。用于调试与无窗口环境。
+//
+// 它是本机调试口，不是对外服务：只接受回环来源，写请求还要求同源 + JSON。
+// 所有超时都显式给上 —— 默认的 http.Server 没有任何超时，一个半开连接就能占住 goroutine。
 func Serve(addr, version string) error {
 	service := NewService(version)
+	service.guardLocal = true
 	// 从浏览器里点「下载并安装」时也要能完成重启：服务进程直接退出，
 	// 交给 RelaunchAfterExit 写的脚本拉起新包。
 	service.onRestart = func() { os.Exit(0) }
-	server := &http.Server{Addr: addr, Handler: service.Handler()}
-	fmt.Printf("AgentSweep %s · http://%s\n", version, addr)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           service.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	fmt.Printf("AgentSweep %s · http://%s（仅本机）\n", version, addr)
 	go service.autoCheckUpdates()
 	return server.ListenAndServe()
 }

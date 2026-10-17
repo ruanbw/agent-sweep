@@ -29,41 +29,152 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # 版本与发布通道只在这里算一次，后面的步骤全部复用。
+      #
+      # 含连字符即预发布（v0.2.0-rc.1）：更新器只读 /releases/latest，
+      # 而 GitHub 的 latest 会跳过 prerelease。所以 RC 必须打上 prerelease 标记，
+      # 否则普通用户会被静默推送到未完成的版本。
+      - name: Release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [[ "${VERSION}" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # 先跑测试：一个坏版本发出去比晚发十分钟贵得多。
       - name: Test
         run: make test
 
       - name: Build universal distribution
-        run: make dist VERSION="${GITHUB_REF_NAME#v}"
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: make dist VERSION="${VERSION}"
 
-      # 发布前最后一关：三个资产必须真的存在，且确实是 universal。
-      # 缺任何一个都直接失败，不会出现「Release 建好了但没附件」的半成品。
-      - name: Verify artifacts
+      # 本地自检：三个资产存在、两个架构、zip 根、版本号。
+      - name: Verify local artifacts
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
           ZIP="dist/AgentSweep-v${VERSION}-darwin-universal.zip"
           TARBALL="dist/agentsweep-v${VERSION}-darwin-universal.tar.gz"
           test -f "${ZIP}"
           test -f "${TARBALL}"
           test -f dist/checksums.txt
-          lipo -archs AgentSweep.app/Contents/MacOS/AgentSweep | grep -qw arm64
-          lipo -archs AgentSweep.app/Contents/MacOS/AgentSweep | grep -qw x86_64
+          # 先在变量里核对架构：lipo | grep -q 在 pipefail 下可能因 SIGPIPE 误报。
+          ARCHS="$(lipo -archs AgentSweep.app/Contents/MacOS/AgentSweep)"
+          echo "archs: ${ARCHS}"
+          case " ${ARCHS} " in
+            *" arm64 "*) ;;
+            *) echo "缺少 arm64 slice" >&2; exit 1 ;;
+          esac
+          case " ${ARCHS} " in
+            *" x86_64 "*) ;;
+            *) echo "缺少 x86_64 slice" >&2; exit 1 ;;
+          esac
           (cd dist && shasum -a 256 -c checksums.txt)
-          unzip -Z1 "${ZIP}" | head -1 | grep -qx 'AgentSweep.app/'
+          # 同理不用 head：sed 会读完全部输入，不会让 unzip 收到 SIGPIPE。
+          FIRST_ENTRY="$(unzip -Z1 "${ZIP}" | sed -n '1p')"
+          test "${FIRST_ENTRY}" = "AgentSweep.app/"
           test "$(plutil -extract CFBundleShortVersionString raw -o - AgentSweep.app/Contents/Info.plist)" = "${VERSION}"
 
-      # 非 draft、附生成好的 release notes。三个资产名就是应用内更新器的契约。
-      - name: Publish GitHub Release
+      # 从这里开始是「发布」，顺序是 draft → 上传 → 校验 → 公开。
+      #
+      # 为什么不直接 gh release create + 附件：那是一次非原子操作，附件传一半失败
+      # 会留下一个公开的 release，更新器看到「有新版本」却下载不到包。draft 对匿名用户
+      # 和 /releases/latest 都不可见，失败时停在 draft 就只是「什么都没发生」。
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          gh release create "${GITHUB_REF_NAME}" \
+          create() {
+            gh release create "${TAG}" \
+              --draft \
+              --verify-tag \
+              --title "AgentSweep ${TAG}" \
+              --generate-notes "$@"
+          }
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            create --prerelease
+          else
+            create
+          fi
+
+      - name: Upload assets to draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG}" \
             "dist/AgentSweep-v${VERSION}-darwin-universal.zip" \
             "dist/agentsweep-v${VERSION}-darwin-universal.tar.gz" \
             "dist/checksums.txt" \
-            --verify-tag \
-            --title "AgentSweep ${GITHUB_REF_NAME}" \
-            --generate-notes
+            --clobber
+
+      # 资产集合必须「恰好等于」三个预期文件，多一个少一个都失败。
+      - name: Verify uploaded asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          printf '%s\n' \
+            "AgentSweep-v${VERSION}-darwin-universal.zip" \
+            "agentsweep-v${VERSION}-darwin-universal.tar.gz" \
+            "checksums.txt" | sort > "${work}/expected.txt"
+          gh release view "${TAG}" --json assets --jq '.assets[].name' | sort > "${work}/actual.txt"
+          diff -u "${work}/expected.txt" "${work}/actual.txt"
+
+      # 把 CDN 上已上传的资产原样下载回来校验：证明「远端字节」=「刚打出来的字节」，
+      # 而不是「本地文件对了、上传坏了」。同时验证 checksums.txt 自身一致。
+      - name: Download and verify published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          gh release download "${TAG}" --dir "${work}"
+          cmp "${work}/checksums.txt" dist/checksums.txt
+          (cd "${work}" && shasum -a 256 -c checksums.txt)
+
+      # 最后一步才公开。前面任何一步失败，Release 都停在 draft：
+      # /latest 看不到、更新器也看不到，不会把半成品推给用户。
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          edit() {
+            gh release edit "${TAG}" --draft=false "$@"
+          }
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            edit --prerelease
+          else
+            edit
+          fi
+          test "$(gh release view "${TAG}" --json isDraft --jq '.isDraft')" = "false"
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            test "$(gh release view "${TAG}" --json isPrerelease --jq '.isPrerelease')" = "true"
+          else
+            test "$(gh release view "${TAG}" --json isPrerelease --jq '.isPrerelease')" = "false"
+          fi

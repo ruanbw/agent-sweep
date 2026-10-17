@@ -9,6 +9,8 @@
 - 时间一律 RFC3339 字符串（`2026-10-17T18:47:59+08:00`）
 - 字节一律 int64
 - 路径一律绝对路径
+- `agentsweep serve` 模式下只接受回环来源；写请求还要求同源 Origin 与
+  `Content-Type: application/json`（桌面壳走 `wails://`，不受此限制）
 
 ## GET /api/bootstrap
 
@@ -162,13 +164,14 @@
 | `available` | 有新版本，可以一键安装 |
 | `unsupported` | 有新版本，但当前不是从 `.app` 运行（或本平台没有包），只能去发布页 |
 | `uptodate` | 已是最新 |
-| `downloading` | 正在下载（`progress` 0–78） |
-| `installing` | 正在校验 / 解压 / 替换（`progress` 78–100） |
+| `downloading` | 正在下载（`progress` 0–70） |
+| `installing` | 正在核对校验和 / 解压 / 替换（`progress` 72–100） |
 | `done` | 装完了，进程即将退出并由脚本重新拉起 |
 | `error` | 查或装失败，原因在 `error` |
 
 检查结果会在 `~/Library/Application Support/AgentSweep/update.json` 缓存 6 小时 ——
-GitHub 匿名 API 有速率限制，启动时没必要每次都联网。
+GitHub 匿名 API 有速率限制，启动时没必要每次都联网。失败的检查只更新缓存文件时间
+（继续节流），不会把失败伪装成「已是最新」。
 
 ## POST /api/update/check
 
@@ -178,11 +181,20 @@ GitHub 匿名 API 有速率限制，启动时没必要每次都联网。
 ## POST /api/update/apply
 
 `{"ok":true}` 立即返回，随后在后台下载 → 核对 `checksums.txt` 里的 SHA-256 →
-解压 → 校验包内 `Info.plist` 版本 → 替换当前 `.app` → 退出并重启。
-期间用 `GET /api/update` 轮询进度。没有新版本、或当前不是从 `.app` 运行时返回 400。
+解压 → 校验包内 `Info.plist` 版本与架构 → 替换当前 `.app` → 退出并重启。
+期间用 `GET /api/update` 轮询进度（建议 1.5s，`installing` 时 0.5s）。
 
-安装只发生在**当前运行的 app bundle** 上，下载与解压落在
-`~/Library/Caches/AgentSweep/updates/`。任一步失败，旧包保持原样。
+- 没有新版本、当前不是从 `.app` 运行、或状态不允许安装：400
+- 已有一次检查/安装在跑：409
+- 所有错误响应都是 `application/json`，形状 `{"error":"人话描述"}`
+
+安装只发生在**当前运行的 app bundle** 上（可能是 `~/Applications`，不一定是
+`/Applications`），下载与解压落在 `~/Library/Caches/AgentSweep/updates/`。
+
+替换顺序是「复制到 `AgentSweep.app.new-*` → 校验 → 旧包改名 `.old-*` → 新包换位」。
+校验、下载、解压、版本/架构检查任何一步失败都不会碰旧包；只有在两次 rename 之间
+进程崩溃/断电这种窗口里，才会出现目标缺失、旁边留着 `.old-*` 的情况，需要手工改名恢复。
+`v0.1.0` 的更新器安装完会退出但不会自动重开（`v0.1.1` 起修复）。
 
 ## POST /api/reveal
 
@@ -191,6 +203,9 @@ GitHub 匿名 API 有速率限制，启动时没必要每次都联网。
 ## POST /api/open
 
 `{"path":"/abs/path"}` → 用默认程序打开。
+
+如果 `path` 是 URL，只放行 `https://github.com/...`（更新器的发布页）；其他站点返回 400，
+避免一条被篡改的缓存把「查看发布页」变成打开任意地址。
 
 ## GET /api/icon?id=<agentId>
 

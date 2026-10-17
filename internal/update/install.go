@@ -25,6 +25,9 @@ var ErrNotAppBundle = errors.New("当前不是从 .app 运行，无法自动安�
 // 给到 1 GB 是为了不误伤未来的体积增长，同时挡住压缩炸弹。
 const maxExtractedBytes = 1 << 30
 
+// maxEntries 挡住「几万个空文件」这种解压放大。正常 .app 最多几千个条目。
+const maxEntries = 20000
+
 // DetectBundle 从可执行文件位置反推 .app 路径。
 //
 // 路径形状是固定的：X.app/Contents/MacOS/X。任何一段对不上都返回 ErrNotAppBundle，
@@ -122,7 +125,11 @@ func (c *Client) Install(ctx context.Context, release *Release, target, workDir 
 	defer os.RemoveAll(staging)
 
 	progress(0, "下载 "+asset.Name)
-	archivePath := filepath.Join(staging, asset.Name)
+	archiveName := filepath.Base(asset.Name)
+	if archiveName == "" || archiveName == "." || archiveName == string(filepath.Separator) {
+		return InstallResult{}, fmt.Errorf("附件名不合法：%q", asset.Name)
+	}
+	archivePath := filepath.Join(staging, archiveName)
 	err = c.Download(ctx, asset, archivePath, func(done, total int64) {
 		if total <= 0 {
 			progress(1, "正在下载…")
@@ -171,6 +178,10 @@ func (c *Client) Install(ctx context.Context, release *Release, target, workDir 
 	if !IsNewer(c.currentVersion(), extractedVersion) {
 		return InstallResult{}, fmt.Errorf("下载到的版本 %s 不比当前版本新", extractedVersion)
 	}
+	// 架构不对的包装上去只会「更新完打不开」，宁可现在拒绝。lipo 不存在时跳过。
+	if err := validateArchitecture(extracted); err != nil {
+		return InstallResult{}, err
+	}
 
 	progress(92, "替换应用")
 	previous := ""
@@ -206,7 +217,11 @@ func extractApp(archivePath, destDir string) (string, error) {
 	defer reader.Close()
 
 	root := ""
-	var total int64
+	var declared int64
+	var extracted int64
+	if len(reader.File) > maxEntries {
+		return "", fmt.Errorf("压缩包条目超过 %d 个，拒绝处理", maxEntries)
+	}
 	for _, entry := range reader.File {
 		name := strings.ReplaceAll(entry.Name, "\\", "/")
 		cleaned := path.Clean(name)
@@ -230,8 +245,8 @@ func extractApp(archivePath, destDir string) (string, error) {
 			return "", fmt.Errorf("压缩包有多个顶层目录：%s 与 %s", root, parts[0])
 		}
 
-		total += int64(entry.UncompressedSize64)
-		if total > maxExtractedBytes {
+		declared += int64(entry.UncompressedSize64)
+		if declared > maxExtractedBytes {
 			return "", errors.New("压缩包解压后超过 1 GB，拒绝处理")
 		}
 		destination := filepath.Join(destDir, filepath.FromSlash(cleaned))
@@ -258,6 +273,10 @@ func extractApp(archivePath, destDir string) (string, error) {
 			if strings.HasPrefix(target, "/") || strings.Contains(target, "..") {
 				return "", fmt.Errorf("压缩包里有可疑符号链接：%s → %s", entry.Name, target)
 			}
+			extracted += int64(len(target))
+			if extracted > maxExtractedBytes {
+				return "", errors.New("压缩包解压后超过 1 GB，拒绝处理")
+			}
 			_ = os.Remove(destination)
 			if err := os.Symlink(target, destination); err != nil {
 				return "", err
@@ -277,7 +296,16 @@ func extractApp(archivePath, destDir string) (string, error) {
 			source.Close()
 			return "", err
 		}
-		_, copyErr := io.Copy(file, source)
+		// 按**实际写出的字节**限流：header 里的 UncompressedSize64 是压缩包自己声明的，
+		// 一个撒谎的包可以在 Go 的 EOF 检查之前就把磁盘填满。
+		remaining := maxExtractedBytes - extracted
+		if remaining <= 0 {
+			source.Close()
+			file.Close()
+			return "", errors.New("压缩包解压后超过 1 GB，拒绝处理")
+		}
+		written, copyErr := io.Copy(file, io.LimitReader(source, remaining+1))
+		extracted += written
 		source.Close()
 		closeErr := file.Close()
 		if copyErr != nil {
@@ -285,6 +313,9 @@ func extractApp(archivePath, destDir string) (string, error) {
 		}
 		if closeErr != nil {
 			return "", closeErr
+		}
+		if extracted > maxExtractedBytes {
+			return "", errors.New("压缩包解压后超过 1 GB，拒绝处理")
 		}
 	}
 	if root == "" {
@@ -319,7 +350,16 @@ func validateBundle(appDir string) error {
 	if executableName == "" {
 		return errors.New("Info.plist 里没有 CFBundleExecutable")
 	}
-	executable := filepath.Join(appDir, "Contents", "MacOS", executableName)
+	// CFBundleExecutable 是包内自述数据，不能让它跳出 Contents/MacOS：
+	// 否则一个伪造的 plist 就能让校验去 stat/chmod 系统上任意已有文件。
+	if executableName != filepath.Base(executableName) || strings.ContainsAny(executableName, `/\`) || strings.Contains(executableName, "..") {
+		return fmt.Errorf("Info.plist 里的 CFBundleExecutable 不合法：%q", executableName)
+	}
+	macOSDir := filepath.Join(appDir, "Contents", "MacOS")
+	executable := filepath.Join(macOSDir, executableName)
+	if filepath.Dir(executable) != macOSDir {
+		return fmt.Errorf("可执行文件不在 Contents/MacOS 内：%q", executableName)
+	}
 	fileInfo, err := os.Stat(executable)
 	if err != nil || fileInfo.IsDir() {
 		return errors.New("包里缺少可执行文件")
@@ -353,6 +393,39 @@ var (
 	shortVersionPattern = regexp.MustCompile(`(?s)<key>CFBundleShortVersionString</key>\s*<string>([^<]*)</string>`)
 )
 
+// validateArchitecture 用 lipo 确认包里真的有本机架构的 slice。
+//
+// 这是额外防线：发布脚本已经把两个架构拼好了，但「标签写对、包装错」正是那种
+// 更新完打不开、又很难在事后解释的故障。lipo 不可用（脚本文件、非 Mach-O）时跳过。
+func validateArchitecture(appDir string) error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	lipo, err := exec.LookPath("lipo")
+	if err != nil {
+		return nil
+	}
+	executableName := bundleExecutableName(appDir)
+	if executableName == "" {
+		return nil
+	}
+	output, err := exec.Command(lipo, "-archs", filepath.Join(appDir, "Contents", "MacOS", executableName)).Output()
+	if err != nil {
+		return nil
+	}
+	wanted := runtime.GOARCH
+	if wanted == "amd64" {
+		wanted = "x86_64"
+	}
+	archs := strings.Fields(string(output))
+	for _, arch := range archs {
+		if arch == wanted {
+			return nil
+		}
+	}
+	return fmt.Errorf("安装包里没有 %s 架构（只有 %s）", wanted, strings.Join(archs, ", "))
+}
+
 // bundleVersion 先按 XML plist 正则读；读不到再退回 plutil（二进制 plist 的兜底）。
 func bundleVersion(appDir string) (string, error) {
 	plistPath := filepath.Join(appDir, "Contents", "Info.plist")
@@ -377,34 +450,40 @@ func bundleVersion(appDir string) (string, error) {
 	return "", errors.New("Info.plist 里没有 CFBundleShortVersionString")
 }
 
-// replaceBundle 用「先挪走旧的、再放进新的、失败就回滚」的顺序替换。
+// replaceBundle 用「先复制到旁边、校验通过、再两次 rename 换位」的顺序替换。
 //
-// 不直接覆盖旧目录：覆盖到一半失败会留下半新半旧、点开就崩的包，
-// 而回滚至少能保证「更新没成功，但原来那个还能用」。
+// 直接把新包复制到目标路径，中途崩溃/休眠会留下一个半新半旧、点开就崩的包；
+// 先落到 target.new-* 再换位，崩溃窗口只剩两个 rename（文件系统层面近似原子），
+// 最坏情况是目标缺失、旁边留着 target.old-*/target.new-*，可以手工恢复。
 func replaceBundle(newApp, target string, progress ProgressFunc) error {
 	parent := filepath.Dir(target)
 	if err := ensureWritable(parent); err != nil {
 		return fmt.Errorf("没有权限写入 %s：%w", parent, err)
 	}
-	oldPath := fmt.Sprintf("%s.old-%d", target, time.Now().Unix())
+	stamp := time.Now().UnixNano()
+	stagedPath := fmt.Sprintf("%s.new-%d", target, stamp)
+	oldPath := fmt.Sprintf("%s.old-%d", target, stamp)
+	defer os.RemoveAll(stagedPath)
+
+	progress(94, "复制新版本")
+	if err := copyBundle(newApp, stagedPath); err != nil {
+		return fmt.Errorf("复制新版本失败：%w", err)
+	}
+	if err := validateBundle(stagedPath); err != nil {
+		return fmt.Errorf("新版本校验失败：%w", err)
+	}
+
 	if err := os.Rename(target, oldPath); err != nil {
 		return fmt.Errorf("移开旧版本失败：%w", err)
 	}
-	rollback := func(cause error) error {
-		_ = os.RemoveAll(target)
-		if err := os.Rename(oldPath, target); err != nil {
-			return fmt.Errorf("%v；旧版本回滚失败，原包保留在 %s：%v", cause, oldPath, err)
+	if err := os.Rename(stagedPath, target); err != nil {
+		if rollbackErr := os.Rename(oldPath, target); rollbackErr != nil {
+			return fmt.Errorf("换上新的版本失败：%v；旧版本回滚失败，原包保留在 %s：%v", err, oldPath, rollbackErr)
 		}
-		return cause
-	}
-	progress(95, "复制新版本")
-	if err := copyBundle(newApp, target); err != nil {
-		return rollback(fmt.Errorf("复制新版本失败：%w", err))
-	}
-	if err := validateBundle(target); err != nil {
-		return rollback(fmt.Errorf("新版本校验失败：%w", err))
+		return fmt.Errorf("换上新的版本失败，已回滚到旧版本：%w", err)
 	}
 	_ = os.RemoveAll(oldPath)
+
 	progress(98, "清理隔离属性")
 	_ = exec.Command("xattr", "-dr", "com.apple.quarantine", target).Run()
 	ensureSignature(target)
@@ -503,8 +582,8 @@ func RelaunchAfterExit(appPath string, pid int, workDir string) error {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return err
 	}
-	scriptPath := filepath.Join(workDir, "relaunch.sh")
-	if err := os.WriteFile(scriptPath, []byte(relaunchScript(appPath, pid)), 0o755); err != nil {
+	scriptPath := filepath.Join(workDir, fmt.Sprintf("relaunch-%d.sh", pid))
+	if err := os.WriteFile(scriptPath, []byte(relaunchScript(appPath, pid)), 0o700); err != nil {
 		return err
 	}
 	command := exec.Command("/bin/sh", scriptPath)
@@ -519,7 +598,13 @@ func RelaunchAfterExit(appPath string, pid int, workDir string) error {
 func relaunchScript(appPath string, pid int) string {
 	return fmt.Sprintf(`#!/bin/sh
 # AgentSweep 更新完成后重启：等旧进程退出，再打开新包。
-while kill -0 %d 2>/dev/null; do sleep 0.2; done
+# 最多等 120 秒（600 × 0.2s）：PID 被复用或变成僵尸时不能让脚本永远转下去。
+i=0
+while kill -0 %d 2>/dev/null; do
+  i=$((i + 1))
+  if [ "$i" -ge 600 ]; then break; fi
+  sleep 0.2
+done
 xattr -dr com.apple.quarantine %s 2>/dev/null
 open -n %s
 `, pid, shellQuote(appPath), shellQuote(appPath))

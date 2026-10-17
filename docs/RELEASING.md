@@ -1,7 +1,7 @@
 # 发布 AgentSweep
 
 这份文档写给两类人：三个月后的自己，和第一次发版的贡献者。
-核心只有一句：**产物名是契约**。应用内更新器靠文件名找包、靠 `checksums.txt` 验包，
+核心只有一句：**产物名是契约**。应用内更新器靠文件名挑包、靠 `checksums.txt` 验包，
 名字一改，用户那边不会报错，只会永远显示「已是最新版本」。
 
 ## 版本策略
@@ -13,6 +13,9 @@
 - 版本号只有一个来源：`make dist VERSION=x.y.z` 通过 `-X main.version=` 注入二进制，
   同一份值写进 `Info.plist`。不要手改任何产物里的版本。
 - 修 bug、补 Agent 目录 → `PATCH`；加功能、改 UI 结构 → `MINOR`；改数据格式 / 删功能 → 等 `1.0` 之后才谈 `MAJOR`。
+- **含连字符的版本是预发布**（`v0.2.0-rc.1`、`v0.2.0-beta.2`）。发布流水线会自动把它标成
+  prerelease；更新器读的是 GitHub 的 `/releases/latest`，而 latest 会跳过 prerelease ——
+  所以 RC 不会被推给普通用户，只有手动下载或 `agentsweep update --check` 之外的显式渠道才会看到。
 
 ## 一次发布的完整流程
 
@@ -32,22 +35,44 @@ tar -xzf dist/agentsweep-v0.1.0-darwin-universal.tar.gz -O agentsweep > /tmp/age
 chmod +x /tmp/agentsweep-term && /tmp/agentsweep-term version   # 期望 0.1.0
 (cd dist && shasum -a 256 -c checksums.txt)
 
-# 4. 打 tag 并推送 —— 推送 tag 就是发布动作，CI 会自动建 Release
+# 4. 打 tag 并推送 —— 推送 tag 就是发布动作
 git tag -a v0.1.0 -m "AgentSweep v0.1.0"
 git push origin master
 git push origin v0.1.0
 ```
 
-推完 tag 去 Actions 看 `Release` 工作流：它会重跑 `make test`、`make dist`，
-校验三个资产都存在且是 universal，再以**非 draft** 方式创建 GitHub Release（release notes 自动生成）。
-任何一步失败都不会发出半成品。
+推完 tag 去 Actions 看 `Release` 工作流：它先重跑 `make test` 和 `make dist`，
+然后 **先建 draft release → 上传三个资产 → 校验远端资产集合与 sha256 → 最后才公开**。
+任何一步失败，Release 都停在 draft：匿名用户和 `/releases/latest` 都看不到，
+更新器也看不到 —— 不会出现「提示有新版本、却下载失败」。
 
 > 不要用 `gh release create` 手动补发。手动发的包不会经过 workflow 里的校验，
 > 而且容易和 tag 里的版本不一致。
 
+## 发布流水线：draft → 校验 → 公开
+
+`release.yml` 的每一步都是「失败即停」，顺序如下：
+
+1. **draft**：`gh release create <tag> --draft --verify-tag --generate-notes`，此时不带资产。
+   预发布版本同时加 `--prerelease`。
+2. **上传**：`gh release upload <tag> <三个资产> --clobber`。
+3. **核对资产集合**：`gh release view --json assets` 必须**恰好**是三个预期文件名，
+   多一个少一个都失败（`diff` 报错即停）。
+4. **回读校验**：把远端已上传的三个文件下载到临时目录，`cmp` 远端 `checksums.txt`
+   与本地一致，再对下载副本跑 `shasum -a 256 -c checksums.txt`。
+   这证明「CDN 上的字节 = 刚打出来的字节」，而不只是本地文件正确。
+5. **公开**：`gh release edit <tag> --draft=false`（预发布再加 `--prerelease`），
+   并断言 `isDraft=false`、`isPrerelease` 与 tag 通道一致。
+
+失败后的收尾：draft 可以直接在 GitHub 上删除；tag 也可以删掉重打
+（`git push origin :refs/tags/v0.1.0`），因为还没有人能看到这次发布。
+
+CI（`ci.yml`）在每次 push/PR 都会跑 `go vet`、`go test -race` 和
+`make dist VERSION=0.0.0-ci` 冒烟：发版脚本本身也是代码，不能等打了 tag 才发现坏了。
+
 ## 资产命名契约（更新器按这个找包）
 
-每次 Release 恰好三个资产：
+每次 Release 恰好三个资产（预发布也一样，只差版本号里的 `-rc.N`）：
 
 | 资产 | 内容 |
 |---|---|
@@ -55,19 +80,35 @@ git push origin v0.1.0
 | `agentsweep-v<semver>-darwin-universal.tar.gz` | 裸 CLI 二进制，包内文件名是 `agentsweep` |
 | `checksums.txt` | `shasum -a 256` 格式：`<sha256>  <filename>`，只含上面两个文件 |
 
-应用内更新器的选择顺序：
+`internal/update.Client.AssetFor` 的实际挑包规则（与代码保持一致）：
 
-1. 优先 `AgentSweep-v<semver>-darwin-universal.zip`；
-2. 没有则回退到 `AgentSweep-v<semver>-darwin-<arch>.zip`（`arm64` / `amd64`，为将来拆分留的口子）；
-3. 下载后从 `checksums.txt` 取同名行的 sha256 校验，**不匹配就放弃安装**；
-4. 解压要求根目录就是 `AgentSweep.app/`，多套一层目录会被判为坏包。
+1. 只看文件名同时含 `agentsweep` 和 `darwin`、且以 `.zip` 结尾的附件；
+2. 名字含 `universal` 的优先（一个包覆盖两种 CPU）；
+3. 否则按本机架构选：`amd64` → `darwin-amd64.zip` 或 `darwin-intel.zip`；
+   `arm64` → `darwin-arm64.zip` 或 `darwin-apple-silicon.zip`；
+4. 选中后从 `checksums.txt` 取**同名行**的 sha256；没有这一行就拒绝安装。
 
 所以：
 
-- 不要改前后缀，不要在文件名里加 `-signed`、`-beta` 之类的后缀；
-- 不要换压缩工具。zip 用 `ditto -c -k --sequesterRsrc --keepParent`，
-  它保留符号链接与资源分叉；用 `zip -r` 打出来的包在替换 `.app` 时可能丢东西；
+- 不要改前后缀，不要在文件名里加 `-signed`、`-beta` 之类的额外后缀；
+- 压缩包必须只有一个顶层目录，且以 `.app` 结尾（正常就是 `AgentSweep.app/`）。
+  更新器用 Go 标准库 `archive/zip` 解压，会忽略 `ditto` 放进来的 `__MACOSX/`，
+  拒绝多个顶层目录、`../` 越界路径和可疑符号链接；
+- 用 `ditto -c -k --sequesterRsrc --keepParent` 打 zip 只是 macOS 的打包惯例，
+  **不是更新器的硬要求**：更新器解压后会核对包内 `Info.plist` 版本，并在签名失效时重做 ad-hoc 签名，
+  不依赖资源分叉或扩展属性。真正不能变的是「zip 根是单个 `AgentSweep.app/`」。
 - 签名变化不算资产变化。包名不变，更新器就能平滑升级。
+
+## 校验能证明什么
+
+`checksums.txt` 解决的是**传输损坏与上传错包**：下载到的 zip 必须与发布附件里的清单一致，
+否则直接放弃安装；它还会核对包内 `Info.plist` 版本等于发布 tag。
+
+它**不能证明发布本身没被替换**：`checksums.txt` 和 zip 来自同一个 GitHub Release，
+仓库或账号被攻破时两者可以一起改。真正的信任边界是 GitHub 账号、仓库权限和 HTTPS，
+不是这个文件。当前构建是 **ad-hoc 签名、未做 Apple 公证**，也不提供可核验的开发者身份。
+如果威胁模型里包含「发布渠道被攻破」，需要的是 Developer ID + notarization，甚至独立签名，
+而不是更长的 checksum 列表。
 
 ## 构建产物从哪来
 
@@ -86,11 +127,34 @@ git push origin v0.1.0
 CI 跑在 `macos-latest`（Apple Silicon）上，与本地 Intel 主机互为验证：
 两台机器都能编出两个架构，通用包才算真的成立。
 
+## 更新器实际做了什么
+
+`internal/update` 是 GUI 与 CLI 共用的同一份实现：
+
+1. **检查**：`GET /repos/ruanbw/agent-sweep/releases/latest`。GUI 在启动后于后台检查，
+   但**最多每 6 小时联网一次**（结果缓存在 `update.json`，设置里可关闭自动检查）；
+   `agentsweep update --check` 是显式检查，不受缓存限制。
+2. **下载**：按上面的规则挑 zip，存到 `~/Library/Application Support/AgentSweep/` 下的临时目录。
+3. **校验**：sha256 对 `checksums.txt`；解压后核对包内版本等于发布版本、且比当前版本新。
+4. **替换**：先把旧包改名为 `AgentSweep.app.old-<unix 时间戳>`，把新包复制到原路径并校验，
+   成功后才删掉旧包；随后去掉 `com.apple.quarantine`，并校验签名（失效则重做 ad-hoc 签名）。
+5. **重启**：GUI 写一个 `relaunch.sh`，等当前进程退出后再 `open -n` 新包。
+
+两个必须知道的边界：
+
+- **替换不是一步原子的。** 旧包改名与新包复制之间如果崩溃/断电，目录里会只剩
+  `AgentSweep.app.old-<时间戳>`，应用「消失」。手动恢复：
+  `mv /Applications/AgentSweep.app.old-<时间戳> /Applications/AgentSweep.app`。
+  替换的是**当前正在运行的那个 bundle**（可能在 `/Applications`，也可能在 `~/Applications`），
+  用户数据目录 `~/Library/Application Support/AgentSweep/` 不参与替换。
+- **v0.1.0 的更新器装完后只退出、不会自动重启**，需要手动打开一次；从 v0.1.1 起自动重启。
+  所以 `v0.1.0 → v0.1.1` 这一次升级会表现为「应用自己关了」，不是崩溃。
+
 ## 签名与 Gatekeeper
 
 当前是 **ad-hoc 签名，未做 Apple 公证**（需要付费开发者账号与 notarization 流程）。
 后果：用户首次打开可能看到「无法验证开发者」，需要右键 →「打开」，
-或执行 `xattr -dr com.apple.quarantine /Applications/AgentSweep.app`。
+或执行 `xattr -dr com.apple.quarantine /Applications/AgentSweep.app`（更新器会自动做这一步）。
 
 这不是 bug，README 的「下载与安装」里已经写明。等有了 Developer ID 再补公证，
 届时资产名与更新流程都不变，只多一步 `codesign`/`notarytool`。
@@ -104,15 +168,21 @@ CI 跑在 `macos-latest`（Apple Silicon）上，与本地 Intel 主机互为验
 - 严重问题需要立刻止损：在 GitHub 上把对应 Release 标为 **pre-release** 或删除，
   同时把 tag 删掉（`git push origin :refs/tags/v0.1.0`），然后发一个更高的 `PATCH`。
   已经装上的用户不会自动降级 —— 这也是为什么发版前 `make test` + 本地 `make dist` 不能省。
+- 更新过程本身可能留下现场：见上一节「替换不是一步原子的」。发布说明里如果要指导用户，
+  给的是手动 `mv` 恢复命令，而不是「重装即可」——数据不会丢，但应用会暂时消失。
 - 不要 force-push 或移动已发布的 tag：对已经下载过的用户不会生效，只会让 `git describe` 与发布记录对不上。
 
 ## 常见失败
 
 | 现象 | 原因 |
 |---|---|
-| `make dist` 报「需要干净的发布版本号」 | 没传 `VERSION`，或工作区 dirty / 不是 tag 提交 |
+| `make dist` 报「需要干净的发布版本号」 | 版本号是 `dev`、含 `dirty`、是 `*-g<sha>*` 的 git describe 结果，或不是 semver。发布时显式传 `VERSION=x.y.z`；不带 `VERSION` 时要求当前 commit 有干净 tag |
+| `make dist` 报「VERSION 不是 semver」 | 同上：只接受 `MAJOR.MINOR.PATCH` 或带连字符/加号的预发布后缀 |
 | `clang: error: unknown target ... arm64` | Xcode CLT 太旧，升级 Command Line Tools |
 | 链接报 `Undefined symbols ... ___isPlatformVersionAtLeast`（arm64） | 用了 Xcode 自带、只有 x86_64 slice 的 `libclang_rt.osx.a`；`make dist` 已优先走 CLT clang，若仍出现说明 CLT 缺失或损坏，重装 `xcode-select --install` |
 | `缺少 build/AgentSweep.icns` | 先 `make icon`（需要 `brew install librsvg`） |
-| 用户更新后打不开 | 检查 zip 根是不是 `AgentSweep.app/`、`Info.plist` 版本是否对、`LSMinimumSystemVersion` 是否被误改 |
+| 用户更新后打不开 | 检查 zip 根是不是单个 `AgentSweep.app/`、`Info.plist` 版本是否对、`LSMinimumSystemVersion` 是否被误改 |
+| 更新后应用「消失」，只剩 `AgentSweep.app.old-*` | 替换过程中崩溃；把 `.old-*` 改回 `AgentSweep.app` 即可 |
+| Release 工作流停在 draft | 该次发布失败，draft 对用户不可见；看 Actions 日志修好后可删 draft/tag 重发 |
 | Release 工作流没触发 | tag 不是 `v*` 形式，或 tag 推到了 fork |
+| RC 出现在了「最新版本」 | 发布时漏了 `--prerelease`（workflow 会按 tag 里的连字符自动加；手动发布别漏） |

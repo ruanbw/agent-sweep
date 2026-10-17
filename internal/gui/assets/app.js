@@ -2165,6 +2165,7 @@
      ========================================================================= */
 
   var UPDATE_POLL_INTERVAL = 1500;
+  var UPDATE_INSTALL_POLL_INTERVAL = 500;
   var UPDATE_STATES = [
     'idle', 'checking', 'available', 'uptodate',
     'downloading', 'installing', 'done', 'error', 'unsupported'
@@ -2258,6 +2259,7 @@
     var value = byId('updateProgressValue');
     var actions = byId('updateActions');
     var install = byId('updateInstallBtn');
+    var installLabel = byId('updateInstallLabel');
     var page = byId('updatePageBtn');
     var notes = byId('updateNotes');
     var notesText = byId('updateNotesText');
@@ -2289,12 +2291,15 @@
       setText(value, pct + '%');
     }
 
-    var showInstall = !!data && name === 'available' && data.canApply;
+    /* A failed install keeps available/canApply, so offer a direct retry. */
+    var showInstall = !!data && data.available && data.canApply &&
+      (name === 'available' || name === 'error');
     var showPage = !!data && !!data.pageUrl && (name === 'available' || name === 'unsupported');
     setHidden(actions, !(showInstall || showPage));
     setHidden(install, !showInstall);
     setHidden(page, !showPage);
     if (install) install.disabled = !!state.update.applying;
+    setText(installLabel, name === 'error' ? '重试安装' : '下载并安装');
 
     var showNotes = !!data && name === 'available' && !!data.notes;
     setHidden(notes, !showNotes);
@@ -2356,10 +2361,14 @@
     }
     var data = state.update.data;
     if (!data || !UPDATE_ACTIVE[data.state]) return;
+    /* The app exits ~1.6s after "done"; poll installing fast enough to see it. */
+    var interval = data.state === 'installing'
+      ? UPDATE_INSTALL_POLL_INTERVAL
+      : UPDATE_POLL_INTERVAL;
     timers.updatePoll = setTimeout(function () {
       timers.updatePoll = null;
       refreshUpdate({ silent: true });
-    }, UPDATE_POLL_INTERVAL);
+    }, interval);
   }
 
   function refreshUpdate(options) {
@@ -2427,11 +2436,8 @@
 
   function applyUpdateNow() {
     var data = state.update.data;
-    if (!data || data.state !== 'available' || state.update.applying) return;
-    if (!data.canApply) {
-      openUpdatePage();
-      return;
-    }
+    if (!data || !data.available || !data.canApply || state.update.applying) return;
+    var previousState = data.state;
     state.update.applying = true;
     state.update.applyStartedAt = Date.now();
     setUpdateState('downloading');
@@ -2443,7 +2449,7 @@
     }, function (err) {
       state.update.applying = false;
       state.update.applyStartedAt = 0;
-      setUpdateState('available');
+      setUpdateState(previousState);
       toast('无法开始安装：' + (err && err.message ? err.message : '未知错误'), {
         tone: 'error',
         actionLabel: '重试',

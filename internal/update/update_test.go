@@ -369,4 +369,119 @@ func TestRelaunchScriptQuotesPath(t *testing.T) {
 	if !strings.Contains(script, "open -n") {
 		t.Fatalf("脚本没有重开应用：%s", script)
 	}
+	if !strings.Contains(script, "600") {
+		t.Fatalf("脚本没有等待上限，PID 复用时会永远转下去：%s", script)
+	}
+}
+
+func TestNewClientRejectsInsecureAPIBase(t *testing.T) {
+	cases := []struct {
+		name     string
+		base     string
+		repo     string
+		wantAPI  string
+		wantRepo string
+	}{
+		{name: "https honored", base: "https://ghe.example.com/api/v3", repo: "acme/agent-sweep",
+			wantAPI: "https://ghe.example.com/api/v3", wantRepo: "acme/agent-sweep"},
+		{name: "loopback http honored", base: "http://127.0.0.1:9999",
+			wantAPI: "http://127.0.0.1:9999", wantRepo: Repo},
+		{name: "localhost http honored", base: "http://localhost:9999",
+			wantAPI: "http://localhost:9999", wantRepo: Repo},
+		{name: "remote http ignored", base: "http://evil.example.com", repo: "evil/repo",
+			wantAPI: DefaultAPIBase, wantRepo: Repo},
+		{name: "repo alone ignored", base: "", repo: "evil/repo",
+			wantAPI: DefaultAPIBase, wantRepo: Repo},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("AGENTSWEEP_UPDATE_API_BASE", testCase.base)
+			t.Setenv("AGENTSWEEP_UPDATE_REPO", testCase.repo)
+			client := NewClient("0.1.0")
+			if client.APIBase != testCase.wantAPI || client.Repo != testCase.wantRepo {
+				t.Fatalf("APIBase/Repo = %q/%q，期望 %q/%q", client.APIBase, client.Repo, testCase.wantAPI, testCase.wantRepo)
+			}
+		})
+	}
+}
+
+func TestAssetForRejectsTraversalName(t *testing.T) {
+	release := &Release{Assets: []Asset{
+		{Name: "AgentSweep-darwin-universal-../../../../x.zip", URL: "https://example.invalid/x"},
+	}}
+	client := &Client{GOOS: "darwin", GOARCH: "amd64"}
+	if asset, err := client.AssetFor(release); err == nil {
+		t.Fatalf("带路径分隔符的附件名必须被拒绝，实际选中 %q", asset.Name)
+	}
+}
+
+func TestDownloadRejectsUnsafeName(t *testing.T) {
+	client := &Client{}
+	if err := client.Download(context.Background(), Asset{Name: "../x.zip", URL: "https://example.invalid/x"}, filepath.Join(t.TempDir(), "x"), nil); err == nil {
+		t.Fatal("不安全附件名必须被拒绝")
+	}
+}
+
+func TestLatestRateLimited(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	_, err := testClient(server).Latest(context.Background())
+	if err == nil {
+		t.Fatal("429 必须返回错误")
+	}
+	if !strings.Contains(err.Error(), "限流") || !strings.Contains(err.Error(), "60") {
+		t.Fatalf("错误信息应说明限流与 Retry-After：%v", err)
+	}
+}
+
+func TestExtractSkipsMacOSXEntries(t *testing.T) {
+	buffer := new(bytes.Buffer)
+	writer := zip.NewWriter(buffer)
+	add := func(name, body string) {
+		entry, _ := writer.Create(name)
+		_, _ = entry.Write([]byte(body))
+	}
+	// ditto --sequesterRsrc 的真实形状：__MACOSX 是第二个顶层目录。
+	add("AgentSweep.app/Contents/Info.plist", infoPlist("0.1.1"))
+	add("AgentSweep.app/Contents/MacOS/AgentSweep", "#!/bin/sh\n")
+	add("__MACOSX/._AgentSweep.app", "resource fork")
+	add("__MACOSX/AgentSweep.app/._Info.plist", "resource fork")
+	_ = writer.Close()
+
+	archive := filepath.Join(t.TempDir(), "ditto.zip")
+	if err := os.WriteFile(archive, buffer.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	appDir, err := extractApp(archive, t.TempDir())
+	if err != nil {
+		t.Fatalf("真实的 ditto 产物不应被拒绝：%v", err)
+	}
+	if _, err := bundleVersion(appDir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExtractRejectsEscapingSymlink(t *testing.T) {
+	buffer := new(bytes.Buffer)
+	writer := zip.NewWriter(buffer)
+	header := &zip.FileHeader{Name: "AgentSweep.app/Contents/Info.plist"}
+	entry, _ := writer.CreateHeader(header)
+	_, _ = entry.Write([]byte(infoPlist("0.1.1")))
+
+	linkHeader := &zip.FileHeader{Name: "AgentSweep.app/escape"}
+	linkHeader.SetMode(os.ModeSymlink | 0o777)
+	link, _ := writer.CreateHeader(linkHeader)
+	_, _ = link.Write([]byte("../../../etc/passwd"))
+	_ = writer.Close()
+
+	archive := filepath.Join(t.TempDir(), "symlink.zip")
+	if err := os.WriteFile(archive, buffer.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := extractApp(archive, t.TempDir()); err == nil {
+		t.Fatal("越界符号链接必须被拒绝")
+	}
 }

@@ -20,8 +20,8 @@ import (
 //	available   有新版本，可以自动装
 //	unsupported 有新版本，但当前不是从 .app 运行，只能去发布页手动下载
 //	uptodate    已是最新
-//	downloading 正在下载（progress 0–78）
-//	installing  正在替换应用（progress 78–100）
+//	downloading 正在下载（progress 0–70）
+//	installing  正在校验 / 解压 / 替换（progress 72–100）
 //	done        装完了，进程马上退出重启
 //	error       查或装失败，见 error
 type UpdateView struct {
@@ -70,6 +70,7 @@ func (s *Service) initUpdate() {
 	}
 	s.updateView = state
 	s.updateCache = filepath.Join(s.appDir, "update.json")
+	s.relaunchUpdate = update.RelaunchAfterExit
 	if cache, ok := readUpdateCache(s.updateCache); ok {
 		s.applyUpdateCache(cache)
 	}
@@ -111,11 +112,16 @@ func readUpdateCache(path string) (updateCache, bool) {
 }
 
 func (s *Service) writeUpdateCache(release *update.Release, asset update.Asset) {
+	// 发布说明可能很长；缓存只负责展示，截断到 256 KB，避免把磁盘当数据库。
+	notes := release.Notes
+	if len(notes) > 256<<10 {
+		notes = notes[:256<<10] + "\n…"
+	}
 	cache := updateCache{
 		CheckedAt:   time.Now(),
 		Tag:         release.Tag,
 		Version:     release.Version,
-		Notes:       release.Notes,
+		Notes:       notes,
 		PageURL:     release.PageURL,
 		AssetName:   asset.Name,
 		AssetSize:   asset.Size,
@@ -125,26 +131,57 @@ func (s *Service) writeUpdateCache(release *update.Release, asset update.Asset) 
 	if err != nil {
 		return
 	}
+	_ = os.MkdirAll(filepath.Dir(s.updateCache), 0o755)
 	_ = os.WriteFile(s.updateCache, data, 0o644)
+}
+
+// MARK: - 状态机
+
+// beginUpdate / endUpdate 用一个 owner 令牌把「检查」和「安装」串行化。
+//
+// 之前是「先读 updateBusy、解锁、再上锁置 true」：两个并发 apply 都能通过，
+// 或者一个 check 与一个 apply 交叉执行，最后两个 replaceBundle 同时改同一个包。
+func (s *Service) beginUpdate(owner string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.updateBusy {
+		return false
+	}
+	s.updateBusy = true
+	s.updateOwner = owner
+	return true
+}
+
+func (s *Service) endUpdate(owner string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.updateOwner == owner {
+		s.updateBusy = false
+		s.updateOwner = ""
+	}
+}
+
+func (s *Service) snapshotUpdate() UpdateView {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	view := s.updateView
+	view.AutoCheck = s.prefs.AutoCheckUpdates
+	return view
 }
 
 // MARK: - handlers
 
 func (s *Service) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "不支持的方法")
 		return
 	}
-	s.mu.Lock()
-	view := s.updateView
-	view.AutoCheck = s.prefs.AutoCheckUpdates
-	s.mu.Unlock()
-	writeJSON(w, view)
+	writeJSON(w, s.snapshotUpdate())
 }
 
 func (s *Service) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "不支持的方法")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
@@ -154,30 +191,38 @@ func (s *Service) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "不支持的方法")
 		return
 	}
 
+	// 检查与置位在同一把锁里完成：两个并发请求只能有一个开始安装。
 	s.mu.Lock()
 	view := s.updateView
-	busy := s.updateBusy
-	s.mu.Unlock()
-
-	if busy {
-		http.Error(w, jsonError("已经有一个更新在进行了"), http.StatusConflict)
+	if s.updateBusy {
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "已经有一个更新在进行了")
 		return
 	}
 	if !view.Available {
-		http.Error(w, jsonError("没有可安装的新版本"), http.StatusBadRequest)
+		s.mu.Unlock()
+		writeError(w, http.StatusBadRequest, "没有可安装的新版本")
 		return
 	}
 	if !view.CanApply {
-		http.Error(w, jsonError("当前不是从 .app 运行，请从发布页手动下载"), http.StatusBadRequest)
+		s.mu.Unlock()
+		writeError(w, http.StatusBadRequest, "当前不是从 .app 运行，请从发布页手动下载")
 		return
 	}
-
-	s.mu.Lock()
+	switch view.State {
+	case "available", "error":
+		// error 也允许：安装失败后 Available 仍然为 true，重试不需要重新联网检查。
+	default:
+		s.mu.Unlock()
+		writeError(w, http.StatusBadRequest, "当前状态不能安装更新")
+		return
+	}
 	s.updateBusy = true
+	s.updateOwner = "install"
 	s.updateView.State = "downloading"
 	s.updateView.Progress = 0
 	s.updateView.Error = ""
@@ -212,18 +257,29 @@ func (s *Service) updateFresh(path string) bool {
 	return time.Since(info.ModTime()) < updateCacheFreshness
 }
 
+// touchUpdateCache 让失败也参与「6 小时一次」的节流。
+//
+// 不写新的检查结果（免得把失败伪装成 uptodate），只更新 mtime。没有缓存时保持没有：
+// 下一次启动本来就是一次合理的重试。
+func (s *Service) touchUpdateCache() {
+	if _, err := os.Stat(s.updateCache); err != nil {
+		return
+	}
+	now := time.Now()
+	_ = os.Chtimes(s.updateCache, now, now)
+}
+
 // checkUpdate 拉一次最新发布并更新状态。
 //
 // 并发调用直接返回当前状态：用户连点「检查更新」不应该打出多个 GitHub 请求。
 func (s *Service) checkUpdate(ctx context.Context) UpdateView {
-	s.mu.Lock()
-	if s.updateBusy {
-		view := s.updateView
-		s.mu.Unlock()
-		return view
+	if !s.beginUpdate("check") {
+		return s.snapshotUpdate()
 	}
+	defer s.endUpdate("check")
+
+	s.mu.Lock()
 	previous := s.updateView
-	s.updateBusy = true
 	s.updateView.State = "checking"
 	s.updateView.Error = ""
 	s.updateView.Progress = 0
@@ -234,7 +290,6 @@ func (s *Service) checkUpdate(ctx context.Context) UpdateView {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.updateBusy = false
 	s.updateView.Current = s.version
 	s.updateView.CheckedAt = time.Now().Format(time.RFC3339)
 
@@ -250,6 +305,7 @@ func (s *Service) checkUpdate(ctx context.Context) UpdateView {
 			s.updateView.AssetName = previous.AssetName
 			s.updateView.AssetBytes = previous.AssetBytes
 		}
+		s.touchUpdateCache()
 		return s.updateView
 	}
 
@@ -267,6 +323,7 @@ func (s *Service) checkUpdate(ctx context.Context) UpdateView {
 	} else {
 		s.updateView.AssetName = ""
 		s.updateView.AssetBytes = 0
+		s.touchUpdateCache()
 	}
 
 	switch {
@@ -287,12 +344,19 @@ func (s *Service) checkUpdate(ctx context.Context) UpdateView {
 // MARK: - 安装
 
 func (s *Service) installUpdate() {
+	defer s.endUpdate("install")
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	s.mu.Lock()
 	release := s.lastRelease
+	target := s.updateTarget
+	relaunch := s.relaunchUpdate
 	s.mu.Unlock()
+	if relaunch == nil {
+		relaunch = update.RelaunchAfterExit
+	}
 	if release == nil {
 		latest, err := s.updater.Latest(ctx)
 		if err != nil {
@@ -302,10 +366,10 @@ func (s *Service) installUpdate() {
 		release = latest
 	}
 
-	result, err := s.updater.Install(ctx, release, "", update.DefaultWorkDir(), func(percent int, note string) {
+	result, err := s.updater.Install(ctx, release, target, update.DefaultWorkDir(), func(percent int, note string) {
 		s.mu.Lock()
 		s.updateView.Progress = percent
-		if percent >= 78 && s.updateView.State == "downloading" {
+		if percent >= 72 && s.updateView.State == "downloading" {
 			s.updateView.State = "installing"
 		}
 		s.mu.Unlock()
@@ -323,7 +387,6 @@ func (s *Service) installUpdate() {
 	s.updateView.Latest = result.Version
 	s.updateView.Available = false
 	s.updateView.Error = ""
-	s.updateBusy = false
 	// 装完就把缓存删掉：下次启动直接问 GitHub，而不是相信「刚装完时」的旧答案。
 	_ = os.Remove(s.updateCache)
 	s.mu.Unlock()
@@ -331,7 +394,7 @@ func (s *Service) installUpdate() {
 	if onRestart != nil {
 		// 先把「等旧进程退出再 open 新包」的脚本挂上去，再退出自己。
 		// 顺序反了就是「应用关了但没重开」——这个 bug 只有真跑一次更新才会发现。
-		if err := update.RelaunchAfterExit(result.Path, os.Getpid(), update.DefaultWorkDir()); err != nil {
+		if err := relaunch(result.Path, os.Getpid(), update.DefaultWorkDir()); err != nil {
 			s.mu.Lock()
 			s.updateView.State = "error"
 			s.updateView.Error = "更新已安装，但自动重启失败：" + err.Error() + "（请手动重新打开）"
@@ -339,14 +402,14 @@ func (s *Service) installUpdate() {
 			return
 		}
 		// 留一拍让前端把「安装完成」画出来，再退出进程交给重启脚本。
-		time.Sleep(900 * time.Millisecond)
+		// 前端在 installing 状态会以 500ms 轮询，1.8s 足够显示 done。
+		time.Sleep(1800 * time.Millisecond)
 		onRestart()
 	}
 }
 
 func (s *Service) failUpdate(err error) {
 	s.mu.Lock()
-	s.updateBusy = false
 	s.updateView.State = "error"
 	s.updateView.Error = err.Error()
 	s.mu.Unlock()

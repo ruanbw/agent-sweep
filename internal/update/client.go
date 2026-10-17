@@ -1,9 +1,13 @@
 // Package update 负责「检查 GitHub 上有没新版本 → 下载 → 校验 → 替换自己的 .app」。
 //
 // 为什么不用 Sparkle：Sparkle 需要 EdDSA 私钥签名与一套 appcast，对一个单二进制、
-// 单维护者的项目来说，运维成本比它挡住的风险更高。这里的信任链更朴素但完整：
-// HTTPS 取发布元数据 → 下载发布附件 → 用同一发布里的 checksums.txt 核对 SHA-256
-// → 只接受根目录是单个 .app、且 Info.plist 版本与发布标签一致的包。
+// 单维护者的项目来说，运维成本比它挡住的风险更高。这里的信任链只解决「传输损坏」与
+// 「发布包和标签对不上」：HTTPS 取发布元数据 → 下载发布附件 → 用同一发布里的
+// checksums.txt 核对 SHA-256 → 只接受根目录是单个 .app、且 Info.plist 版本与发布
+// 标签一致的包。
+//
+// 它**不**证明发布本身没被替换：checksums.txt 和附件来自同一个发布，仓库被攻破时
+// 两者可以一起改。真正的发布授权边界是 GitHub 账号与仓库权限，不是这个文件。
 package update
 
 import (
@@ -14,8 +18,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -47,7 +54,7 @@ type Release struct {
 }
 
 // ErrNoRelease 表示仓库还没有任何正式发布。
-var ErrNoRelease = errors.New("还没有发布任何版本")
+var ErrNoRelease = errors.New("还没有发布任何版本（或仓库已改名、转为私有）")
 
 // Client 是 GitHub Releases 的最小客户端。
 //
@@ -63,14 +70,23 @@ type Client struct {
 
 // NewClient 按环境变量与当前版本构造默认客户端。
 //
-// AGENTSWEEP_UPDATE_API_BASE / AGENTSWEEP_UPDATE_REPO 是给测试与自托管 fork 用的，
-// 正常用户不会碰它们，所以不写进文档。
+// AGENTSWEEP_UPDATE_API_BASE / AGENTSWEEP_UPDATE_REPO 是给测试与本地调试用的。
+// 它不能把正式构建变成「从一个任意地址明文拉包」的通道：只接受 https，或回环地址上的
+// http（httptest 用），否则整组覆盖都被忽略、回落到官方 API。自定义仓库必须和自定义
+// API 一起出现，避免只改 repo 就把更新源指向别人的仓库。
 func NewClient(current string) *Client {
 	apiBase := strings.TrimSpace(os.Getenv("AGENTSWEEP_UPDATE_API_BASE"))
+	repo := strings.TrimSpace(os.Getenv("AGENTSWEEP_UPDATE_REPO"))
+	if apiBase != "" && !allowedAPIBase(apiBase) {
+		apiBase = ""
+		repo = ""
+	}
+	if apiBase == "" {
+		repo = ""
+	}
 	if apiBase == "" {
 		apiBase = DefaultAPIBase
 	}
-	repo := strings.TrimSpace(os.Getenv("AGENTSWEEP_UPDATE_REPO"))
 	if repo == "" {
 		repo = Repo
 	}
@@ -84,11 +100,45 @@ func NewClient(current string) *Client {
 	}
 }
 
+// allowedAPIBase 只放行 https 与回环 http。明文远程地址等于把「谁来投毒更新」交给网络。
+func allowedAPIBase(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	switch parsed.Scheme {
+	case "https":
+		return true
+	case "http":
+		return isLoopbackHost(parsed.Hostname())
+	default:
+		return false
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
+}
+
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
 	return http.DefaultClient
+}
+
+// downloadClient 复用同一个 Transport，但去掉整体超时：大文件由 context 限时。
+func (c *Client) downloadClient() *http.Client {
+	base := c.httpClient()
+	transport := base.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	return &http.Client{Transport: transport}
 }
 
 func (c *Client) apiBase() string {
@@ -137,7 +187,11 @@ func (c *Client) Latest(ctx context.Context) (*Release, error) {
 	case http.StatusNotFound:
 		return nil, ErrNoRelease
 	case http.StatusForbidden, http.StatusTooManyRequests:
-		return nil, errors.New("GitHub 拒绝了这次请求（可能触发限流），稍后再试")
+		hint := ""
+		if retryAfter := response.Header.Get("Retry-After"); retryAfter != "" {
+			hint = "（建议 " + retryAfter + " 秒后再试）"
+		}
+		return nil, fmt.Errorf("GitHub 拒绝了这次请求，可能触发限流%s", hint)
 	default:
 		return nil, fmt.Errorf("GitHub 返回 %s", response.Status)
 	}
@@ -209,6 +263,10 @@ func (c *Client) AssetFor(release *Release) (Asset, error) {
 	var best Asset
 	bestScore := 0
 	for _, asset := range release.Assets {
+		// 附件名来自远端，不能带路径分隔符或 ..：它会被拼进本地暂存目录。
+		if asset.Name != filepath.Base(asset.Name) || strings.ContainsAny(asset.Name, `/\`) || strings.Contains(asset.Name, "..") {
+			continue
+		}
 		lower := strings.ToLower(asset.Name)
 		if !strings.Contains(lower, "agentsweep") || !strings.Contains(lower, "darwin") || !strings.HasSuffix(lower, ".zip") {
 			continue
@@ -219,7 +277,7 @@ func (c *Client) AssetFor(release *Release) (Asset, error) {
 			score = 3
 		case strings.Contains(lower, goarch):
 			score = 2
-		case goarch == "amd64" && strings.Contains(lower, "intel"):
+		case goarch == "amd64" && (strings.Contains(lower, "intel") || strings.Contains(lower, "x86_64")):
 			score = 2
 		case goarch == "arm64" && strings.Contains(lower, "apple-silicon"):
 			score = 2
@@ -300,13 +358,20 @@ func isHex(text string) bool {
 // Download 把附件下载到 dest，边下边回报进度。
 //
 // 先写 .part 再改名：中途断网留下半个文件，下次不会把它当完整的包用。
+//
+// 这里刻意不用 Client.HTTP 的 30 秒总超时：发布包有十几 MB，慢链路上下不完是常态，
+// 而「下到一半被整体超时掐断」对用户毫无解释力。安装调用方给的是一个 15 分钟的
+// context，真正的取消边界交给它。
 func (c *Client) Download(ctx context.Context, asset Asset, dest string, progress func(done, total int64)) error {
+	if asset.Name != filepath.Base(asset.Name) || strings.ContainsAny(asset.Name, `/\`) {
+		return fmt.Errorf("附件名不合法：%q", asset.Name)
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, asset.URL, nil)
 	if err != nil {
 		return err
 	}
 	request.Header.Set("User-Agent", c.userAgent())
-	response, err := c.httpClient().Do(request)
+	response, err := c.downloadClient().Do(request)
 	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("下载超时：%w", ctx.Err())

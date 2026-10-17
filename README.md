@@ -31,16 +31,28 @@ xattr -dr com.apple.quarantine /Applications/AgentSweep.app
 cd ~/Downloads && shasum -a 256 -c checksums.txt
 ```
 
+`checksums.txt` 能发现下载损坏或上传错包，但**不能证明发布没被替换**：清单和 zip 来自同一个
+Release，仓库被攻破时两者会一起改。真正的信任边界是 GitHub 账号与仓库权限。
+
 版本号与产物命名规则（也就是应用内更新器的选包契约）见 [`docs/RELEASING.md`](docs/RELEASING.md)。
 
 ## 自动更新
 
-应用启动后会检查一次 GitHub Releases。有新版本时界面上会提示，点「下载并安装」后自动替换、
-重启生效；下载的包会用 `checksums.txt` 里的 sha256 校验，只接受本仓库 Release 的产物。
-不想被提示可以在设置里关掉自动检查。
+应用会在后台检查 GitHub Releases，但**最多每 6 小时联网一次**（结果缓存在本地，设置里可关掉自动检查）。
+有新版本时界面上会提示，点「下载并安装」后自动完成下载、sha256 校验、替换和重启。
+GUI 会等旧进程退出后再打开新包；**v0.1.0 例外**：它的更新器装完只退出、不会自动重启，
+需要手动打开一次，从 v0.1.1 起修复。
 
-自动更新和手动覆盖 `/Applications/AgentSweep.app` 等价。用户数据（索引、journal、适配器）在
-`~/Library/Application Support/AgentSweep/`，不会随 .app 一起被替换。
+更新替换的是**当前正在运行的那个 `AgentSweep.app`**（可能在 `/Applications`，也可能在
+`~/Applications` 或你放它的任何位置）：旧包先改名到旁边、新包复制进来、去掉 quarantine、
+校验签名（失效则重做 ad-hoc 签名）。`~/Library/Application Support/AgentSweep/` 里的索引、journal、适配器不受影响。
+
+自动更新不是唯一入口，命令行也能检查：
+
+```bash
+agentsweep update --check   # 只检查是否有新版本
+agentsweep update --json    # 机器可读结果（不安装）
+```
 
 ## 为什么重做
 
@@ -141,7 +153,9 @@ agentsweep scan --json            # 与 HTTP 同构的 JSON
 agentsweep clean --agent dsh      # 移入废纸篓
 agentsweep clean --agent dsh --permanent
 agentsweep discover               # 找出目录里没有的 Agent
-agentsweep serve --addr :8766     # 只开 HTTP（调试 UI / 无窗口环境）
+agentsweep update --check         # 只检查是否有新版本
+agentsweep update --json          # 机器可读的检查结果（不安装）
+agentsweep serve --addr 127.0.0.1:8766   # 只开本机 HTTP（调试 UI / 无窗口环境）
 ```
 
 ## 加一款目录里没有的 Agent

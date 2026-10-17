@@ -16,7 +16,7 @@ concurrency:
 jobs:
   test:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -30,5 +30,12 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go test
-        run: go test ./...
+      # 加 -race：扫描、撤销、更新替换这些路径的并发问题，只有竞态检测器能兜住。
+      - name: go test (race)
+        run: go test -race ./...
+
+      # 发版脚本也是代码。在 PR 阶段真打一次 universal 包、跑一遍 Makefile 自检：
+      # Makefile / Info.plist / 版本注入的回归就不会拖到打 tag 之后才暴露。
+      # 用 0.0.0-ci 这种明显非发布的版本，避免和真实发布产物混淆。
+      - name: Distribution smoke test
+        run: make dist VERSION=0.0.0-ci

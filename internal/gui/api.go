@@ -1,13 +1,16 @@
 package gui
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -115,12 +118,17 @@ type Service struct {
 
 	// 更新相关的状态都在 update.go 里维护，这里只放字段：
 	// updater 在 NewService 之后不再改变，updateView / lastRelease 由 mu 保护。
-	updater     *update.Client
-	updateView  UpdateView
-	updateBusy  bool
-	updateCache string
-	lastRelease *update.Release
-	onRestart   func()
+	updater        *update.Client
+	updateView     UpdateView
+	updateBusy     bool
+	updateOwner    string
+	updateCache    string
+	updateTarget   string // 测试注入；空 = 安装到当前运行的 .app
+	lastRelease    *update.Release
+	relaunchUpdate func(appPath string, pid int, workDir string) error
+	onRestart      func()
+	// guardLocal 只在 serve 模式打开：桌面壳用 wails://，不需要也不应该套这层限制。
+	guardLocal bool
 }
 
 func NewService(version string) *Service {
@@ -161,7 +169,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/update/check", s.handleUpdateCheck)
 	mux.HandleFunc("/api/update/apply", s.handleUpdateApply)
 	mux.Handle("/", staticHandler())
-	return mux
+	return s.guard(mux)
 }
 
 // MARK: - bootstrap
@@ -222,7 +230,7 @@ func (s *Service) handleScan(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		writeJSON(w, status)
 	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
@@ -305,14 +313,14 @@ func (s *Service) startScan() {
 
 func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	var body struct {
 		UIDs []string `json:"uids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"请求体不是合法 JSON"}`, http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
 		return
 	}
 
@@ -408,7 +416,7 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) handleUndo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	var body struct {
@@ -416,7 +424,7 @@ func (s *Service) handleUndo(w http.ResponseWriter, r *http.Request) {
 		BatchIDs []string `json:"batchIds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"请求体不是合法 JSON"}`, http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
 		return
 	}
 	ids := body.BatchIDs
@@ -478,7 +486,7 @@ func (s *Service) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	}
 	candidates, err := probe.Discover(specs)
 	if err != nil {
-		http.Error(w, jsonError(err.Error()), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.mu.Lock()
@@ -492,19 +500,19 @@ func (s *Service) handleAdapters(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var spec catalog.Spec
 		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
-			http.Error(w, jsonError("适配器不是合法 JSON"), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "适配器不是合法 JSON")
 			return
 		}
 		if spec.ID == "" || spec.Name == "" || len(spec.Roots) == 0 {
-			http.Error(w, jsonError("适配器至少要填 id / name / roots"), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "适配器至少要填 id / name / roots")
 			return
 		}
 		if len(spec.Stores) == 0 {
-			http.Error(w, jsonError("适配器至少要声明一个 store"), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "适配器至少要声明一个 store")
 			return
 		}
 		if err := catalog.AddCustom(spec); err != nil {
-			http.Error(w, jsonError(err.Error()), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		s.invalidate()
@@ -513,17 +521,17 @@ func (s *Service) handleAdapters(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		removed, err := catalog.RemoveCustom(id)
 		if err != nil {
-			http.Error(w, jsonError(err.Error()), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		if !removed {
-			http.Error(w, jsonError("内置 Agent 不能删除"), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "内置 Agent 不能删除")
 			return
 		}
 		s.invalidate()
 		writeJSON(w, map[string]any{"ok": true})
 	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
@@ -550,12 +558,12 @@ func (s *Service) handlePrefs(w http.ResponseWriter, r *http.Request) {
 		// 于是一改删除模式就会悄悄关掉「删除前确认」。字段存在才改。
 		var raw map[string]json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-			http.Error(w, jsonError("设置不是合法 JSON"), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "设置不是合法 JSON")
 			return
 		}
+		// 读-改-写在同一个临界区里：并发切两个开关时，先解锁再写回会丢掉其中一个。
 		s.mu.Lock()
 		prefs := s.prefs
-		s.mu.Unlock()
 		autoCheckBefore := prefs.AutoCheckUpdates
 		if value, ok := raw["deleteMode"]; ok {
 			var mode string
@@ -573,19 +581,24 @@ func (s *Service) handlePrefs(w http.ResponseWriter, r *http.Request) {
 				_ = json.Unmarshal(value, target)
 			}
 		}
-		s.mu.Lock()
-		s.prefs = prefs
-		s.mu.Unlock()
 		if err := savePrefs(s.appDir, prefs); err != nil {
-			http.Error(w, jsonError(err.Error()), http.StatusInternalServerError)
+			s.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		s.prefs = prefs
+		s.mu.Unlock()
 		writeJSON(w, prefs)
 		if prefs.AutoCheckUpdates && !autoCheckBefore {
-			go s.autoCheckUpdates()
+			// 打开开关就立刻查一次；缓存新鲜也不能跳过，否则用户会以为开关没生效。
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				s.checkUpdate(ctx)
+			}()
 		}
 	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "不支持的方法")
 	}
 }
 
@@ -595,7 +608,7 @@ func (s *Service) handleReveal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := exec.Command("open", "-R", path).Run(); err != nil {
-		http.Error(w, jsonError(err.Error()), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})
@@ -606,11 +619,33 @@ func (s *Service) handleOpen(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		return
 	}
+	// 前端只会用它打开两种东西：会话文件，或 GitHub 发布页。URL 走白名单，
+	// 免得一条被污染的缓存把 releasePage 变成任意命令/任意站点。
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		if !allowedExternalURL(path) {
+			writeError(w, http.StatusBadRequest, "只允许打开 GitHub 上的发布页")
+			return
+		}
+	}
 	if err := exec.Command("open", path).Run(); err != nil {
-		http.Error(w, jsonError(err.Error()), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// allowedExternalURL 只放行 GitHub 域名。更新器的 pageUrl 来自发布元数据，
+// 正常永远是 github.com；这里不做「尽量放行」，宁可让异常值打不开。
+func allowedExternalURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	if parsed.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "github.com" || host == "www.github.com"
 }
 
 func decodePath(w http.ResponseWriter, r *http.Request) string {
@@ -618,7 +653,7 @@ func decodePath(w http.ResponseWriter, r *http.Request) string {
 		Path string `json:"path"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Path == "" {
-		http.Error(w, jsonError("缺少 path"), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "缺少 path")
 		return ""
 	}
 	return body.Path
@@ -662,9 +697,16 @@ func writeJSON(w http.ResponseWriter, value any) {
 	_ = encoder.Encode(value)
 }
 
-func jsonError(message string) string {
-	data, _ := json.Marshal(map[string]string{"error": message})
-	return string(data)
+// writeError 统一错误响应：Content-Type 必须是 JSON。
+//
+// 之前用 http.Error 会把它写成 text/plain，前端解析失败只能显示「HTTP 409」，
+// 而真正有用的那句话（比如「已经有一个更新在进行了」）被丢掉了。
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	_ = encoder.Encode(map[string]string{"error": message})
 }
 
 func loadPrefs(dir string) Prefs {

@@ -77,8 +77,8 @@ func usage() {
   agentsweep clean --agent <id>       把该 Agent 的全部会话移入废纸篓
   agentsweep clean --agent <id> --permanent
   agentsweep discover [--json]       找目录里没有的 Agent
-  agentsweep serve [--addr host:port] 只开 HTTP 服务（调试 UI / 无窗口环境）
-  agentsweep update [--check]        检查并安装新版本（GUI 里也能做）
+  agentsweep serve [--addr host:port] 只开本机 HTTP 服务（调试 UI / 无窗口环境）
+  agentsweep update [--check|--json]  检查并安装新版本（GUI 里也能做）
   agentsweep version
 `)
 }
