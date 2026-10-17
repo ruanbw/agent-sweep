@@ -450,6 +450,36 @@ func bundleVersion(appDir string) (string, error) {
 	return "", errors.New("Info.plist 里没有 CFBundleShortVersionString")
 }
 
+// commandFunc 执行一条外部命令并返回合并后的 stdout+stderr。
+//
+// 抽成参数而不是直接 exec.Command：codesign/xattr 会改真实签名、ditto 会真的落盘，
+// 测试里必须能全部替掉。
+// 用参数注入而不是包级变量，是因为包级可变状态会让并行测试互相踩，
+// 而安装路径恰好最不能容忍「测到的不是跑到的」。
+type commandFunc func(name string, args ...string) ([]byte, error)
+
+// runCommand 是生产路径上的实现。
+func runCommand(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
+}
+
+// commandFailure 拼出「哪条命令失败、为什么、命令自己说了什么」。
+//
+// 只有 exit status 1 的错误对用户毫无信息量，所以带上 stderr 摘要；但摘要要限长：
+// codesign --deep 失败时会把整棵包的内容打出来，全量塞进 UI 没有人看得完。
+func commandFailure(name string, args []string, output []byte, err error) error {
+	command := name + " " + strings.Join(args, " ")
+	summary := strings.TrimSpace(string(output))
+	if summary == "" {
+		return fmt.Errorf("%s 失败：%w", command, err)
+	}
+	const maxSummaryRunes = 400
+	if runes := []rune(summary); len(runes) > maxSummaryRunes {
+		summary = string(runes[:maxSummaryRunes]) + "…"
+	}
+	return fmt.Errorf("%s 失败：%w；输出：%s", command, err, summary)
+}
+
 // replaceBundle 用「先复制到旁边、校验通过、再两次 rename 换位」的顺序替换。
 //
 // 直接把新包复制到目标路径，中途崩溃/休眠会留下一个半新半旧、点开就崩的包；
@@ -459,6 +489,13 @@ func bundleVersion(appDir string) (string, error) {
 // 被杀死时函数没有机会回滚，仍会留下 target.old-*，需要手工移回 —— 那是崩溃，
 // 不是可处理的错误返回路径。
 func replaceBundle(newApp, target string, progress ProgressFunc) error {
+	return replaceBundleWith(newApp, target, progress, runCommand, ensureSignature)
+}
+
+// replaceBundleWith 是 replaceBundle 的实现。run 与 sign 两个注入口让测试能替掉
+// ditto/xattr/codesign —— 它们会真的改一份签名，测试里一条都不能执行。
+// sign 单独一个口，是因为它还要先判断 codesign 在不在、签名是否已经存在。
+func replaceBundleWith(newApp, target string, progress ProgressFunc, run commandFunc, sign func(string) error) error {
 	parent := filepath.Dir(target)
 	if err := ensureWritable(parent); err != nil {
 		return fmt.Errorf("没有权限写入 %s：%w", parent, err)
@@ -471,7 +508,7 @@ func replaceBundle(newApp, target string, progress ProgressFunc) error {
 	defer os.RemoveAll(stagedPath)
 
 	progress(94, "复制新版本")
-	if err := copyBundle(newApp, stagedPath); err != nil {
+	if err := copyBundle(newApp, stagedPath, run); err != nil {
 		return fmt.Errorf("复制新版本失败：%w", err)
 	}
 	if err := validateBundle(stagedPath); err != nil {
@@ -481,14 +518,34 @@ func replaceBundle(newApp, target string, progress ProgressFunc) error {
 	if err := swapBundle(target, stagedPath, oldPath, os.Rename); err != nil {
 		return err
 	}
-	// 新包已经就位，旧包清不掉也不该回滚（回滚会再造一个空窗），但必须上报。
-	cleanupErr := removeOldBundle(oldPath)
+	// 新包已经就位。从这里往下的失败一律不回滚：回滚会再造一次空窗，
+	// 用户手上只剩一个半新半旧的包。但每一步失败都不能吞 —— 旧包占着磁盘、
+	// Gatekeeper 拦截、签名坏了起不来，这三种后果都得让用户看见。
+	var failures []error
+	if err := removeOldBundle(oldPath); err != nil {
+		failures = append(failures, err)
+	}
 
 	progress(98, "清理隔离属性")
-	_ = exec.Command("xattr", "-dr", "com.apple.quarantine", target).Run()
-	ensureSignature(target)
+	if err := removeQuarantine(target, run); err != nil {
+		failures = append(failures, err)
+	}
+	if err := sign(target); err != nil {
+		failures = append(failures, err)
+	}
+	return postReplaceFailure(target, failures)
+}
 
-	return cleanupErr
+// postReplaceFailure 把「新包已就位之后」的失败汇总成一个错误。
+//
+// errors.Join 保留每一条原因，而不是只报最后一条：去隔离与重签同时失败时，
+// UI/日志里两条都得在，用户才知道该先修哪一条。文案必须说清新版本已经就位，
+// 否则用户只会看到一句失败、然后去旧位置找一个已经被换掉的包。
+func postReplaceFailure(target string, failures []error) error {
+	if len(failures) == 0 {
+		return nil
+	}
+	return fmt.Errorf("新版本已就位（%s），但收尾失败：%w", target, errors.Join(failures...))
 }
 
 // renameFunc 让测试可以注入「第二次换位失败」这类真实环境难以构造的错误。
@@ -535,13 +592,19 @@ func removeOldBundle(oldPath string) error {
 }
 
 // copyBundle 优先用 ditto：它保留资源分支、扩展属性与权限，签名才不会因为复制而失效。
-func copyBundle(source, destination string) error {
-	if _, err := exec.LookPath("ditto"); err == nil {
-		if output, err := exec.Command("ditto", source, destination).CombinedOutput(); err == nil {
-			return nil
-		} else if strings.TrimSpace(string(output)) != "" {
-			return fmt.Errorf("%s", strings.TrimSpace(string(output)))
-		}
+// run 让测试能替掉 ditto —— 测试里不执行任何真实外部命令。
+func copyBundle(source, destination string, run commandFunc) error {
+	if _, err := exec.LookPath("ditto"); err != nil {
+		return copyTree(source, destination)
+	}
+	output, err := run("ditto", source, destination)
+	if err == nil {
+		return nil
+	}
+	// ditto 一个字都没说却失败时（极少见）仍然退回纯 Go 复制：
+	// 这与原来「有输出就报错、没输出就兜底」的行为一致。
+	if message := strings.TrimSpace(string(output)); message != "" {
+		return fmt.Errorf("ditto %s → %s 失败：%w；输出：%s", source, destination, err, message)
 	}
 	return copyTree(source, destination)
 }
@@ -601,18 +664,45 @@ func ensureWritable(directory string) error {
 	return os.Remove(name)
 }
 
+// removeQuarantine 去掉 Gatekeeper 的隔离属性。
+//
+// 失败不回滚（新包已经在目标位置），但必须上报：留着 com.apple.quarantine 的包
+// 下次打开会被 Gatekeeper 拦下，而用户刚看到「更新成功」，只会以为应用坏了。
+func removeQuarantine(appDir string, run commandFunc) error {
+	args := []string{"-dr", "com.apple.quarantine", appDir}
+	if output, err := run("xattr", args...); err != nil {
+		return commandFailure("xattr", args, output, err)
+	}
+	return nil
+}
+
 // ensureSignature 检查签名，坏了就重新做一次 ad-hoc 签名。
 //
 // 我们发布的就是 ad-hoc 签名，重新签不会降低安全性；但少了这一步，
 // 被 ditto 之外的方式复制过的包会直接拒绝启动。
-func ensureSignature(appDir string) {
+// codesign 不可用时仍然跳过：没有工具就没有可做的事，这不是安装失败。
+func ensureSignature(appDir string) error {
 	if _, err := exec.LookPath("codesign"); err != nil {
-		return
+		return nil
 	}
-	if exec.Command("codesign", "--verify", "--deep", "--strict", appDir).Run() == nil {
-		return
+	return ensureSignatureWith(appDir, runCommand)
+}
+
+// ensureSignatureWith 是 ensureSignature 的实现，run 让测试能替掉真实的 codesign。
+//
+// 「签名已存在」的判断保留在这里：verify 能过就原样不动，因为重签会把发布方的
+// 签名标识换成 ad-hoc。verify 不过才 --force 重签，而重签失败必须变成错误 ——
+// 那正是「更新完打不开」的直接原因。
+func ensureSignatureWith(appDir string, run commandFunc) error {
+	verifyArgs := []string{"--verify", "--deep", "--strict", appDir}
+	if _, err := run("codesign", verifyArgs...); err == nil {
+		return nil
 	}
-	_ = exec.Command("codesign", "--force", "--deep", "--sign", "-", appDir).Run()
+	signArgs := []string{"--force", "--deep", "--sign", "-", appDir}
+	if output, err := run("codesign", signArgs...); err != nil {
+		return commandFailure("codesign", signArgs, output, err)
+	}
+	return nil
 }
 
 // RelaunchAfterExit 写一个分离的 shell 脚本：等当前进程退出，再打开新包。
