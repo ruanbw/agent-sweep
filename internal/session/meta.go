@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -312,7 +313,9 @@ func ParseJSONObject(head []byte) Meta {
 		return meta
 	}
 	// 截断的 JSON：用逐行兜底，把能认出来的字符串捞出来。
-	if strings.Contains(string(head), "\"messages\"") || strings.Contains(string(head), "\"conversation\"") {
+	// head 最多 1MB，转一次 string 就够；旧写法在 || 两侧各转了一次。
+	headText := string(head)
+	if strings.Contains(headText, "\"messages\"") || strings.Contains(headText, "\"conversation\"") {
 		meta.mergeLoose(head)
 	}
 	return meta
@@ -672,13 +675,50 @@ func isBoilerplate(s string) bool {
 	return false
 }
 
+// clean 把一段可能很长的正文压成 80 字以内的标题。
+//
+// 单趟按 rune 扫描、边扫边写：标题只值 80 字，而正文动辄几百 KB、单条消息
+// 可以是 MB 级 —— 旧实现先 Fields+Join 生成一份整串副本，再 []rune 又整串
+// 拷贝一遍，16 并发解析时是实打实的 CPU/分配尖峰。这里不构造 []rune，也不
+// 对整串做 Fields。
+//
+// 语义与旧实现（ReplaceAll(CR/LF) → Fields → Join → 截 80 rune → TrimSpace）
+// 逐字节一致：
+//   - 任意空白（unicode.IsSpace）折叠成一个空格，首尾空白丢弃；
+//   - 最多保留前 80 个 rune（不是字节）；
+//   - 后面还有非空白内容时追加 "…"；正好 80 字、或第 81 个是空白时不追加；
+//   - 截断点若是分隔空格，省略号前不会留下尾随空格。
 func clean(s string) string {
-	s = strings.ReplaceAll(s, "\r", " ")
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.Join(strings.Fields(s), " ")
-	runes := []rune(s)
-	if len(runes) > 80 {
-		return strings.TrimSpace(string(runes[:80])) + "…"
+	const limit = 80
+	var b strings.Builder
+	// 常见标题以 3 字节中文为主，按 80*3+1 预留；4 字节字符由 Builder 自行扩容。
+	b.Grow(limit*3 + 1)
+
+	count := 0            // 已写入的 rune 数（含分隔空格）
+	pendingSpace := false // 上一个被折叠掉的空白，等下一个非空白字符再落笔
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			if count > 0 {
+				pendingSpace = true
+			}
+			continue
+		}
+		need := 1
+		if pendingSpace {
+			need = 2 // 分隔空格 + 这个字符
+		}
+		if count+need > limit {
+			// 这个字符（连同前面的分隔空格）放不进 80 字：旧实现会在截断后
+			// TrimSpace 掉那个尾随空格，这里直接不写，效果相同。
+			return b.String() + "…"
+		}
+		if pendingSpace {
+			b.WriteByte(' ')
+			count++
+			pendingSpace = false
+		}
+		b.WriteRune(r)
+		count++
 	}
-	return strings.TrimSpace(s)
+	return b.String()
 }
