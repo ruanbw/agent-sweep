@@ -276,7 +276,11 @@ func buildFileSession(spec catalog.Spec, home string, store catalog.Store, file 
 	// 会话正在使用时，Agent 会持有这个 lock 文件（flock）。
 	// 试一次非阻塞独占锁：拿不到 = 有人在用。这比看 mtime 准得多 ——
 	// mtime 只能说明「最近写过」，而一个刚被读过的旧会话 mtime 不会变。
-	item.Active = lockHeld(filepath.Join(dir, id+".lock")) || lockHeld(filepath.Join(dir, "session.lock"))
+	// 判定不了（打不开/权限不足）时取保守值 true：宁可多提示一次「使用中」。
+	item.Active = activeFromLock(sessionLockState(
+		filepath.Join(dir, id+".lock"),
+		filepath.Join(dir, "session.lock"),
+	))
 	return item
 }
 
@@ -327,7 +331,7 @@ func scanDirs(spec catalog.Spec, home string, store catalog.Store) ([]session.Se
 			item.Snippet = item.Project
 		}
 		applyAssoc(home, dir, store.Assoc, id, &item)
-		item.Active = lockHeld(filepath.Join(dir, "session.lock"))
+		item.Active = activeFromLock(sessionLockState(filepath.Join(dir, "session.lock")))
 		out = append(out, item)
 	}
 	return out, nil
@@ -583,22 +587,81 @@ func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
+// lockState 是 lock 文件的三态判断结果。
+//
+// 三态而不是 bool：`打不开` 和 `没人锁` 是两件事，把前者当成后者会让
+// 「正在使用」的会话显示成空闲，用户于是勾选并删掉它。
+type lockState int
+
+const (
+	// lockFree 确定没有活着的进程持有这个 lock 文件。
+	lockFree lockState = iota
+	// lockBusy 确定有别的进程持有这把锁。
+	lockBusy
+	// lockUnknown 无法判断（打不开、权限不足、flock 报错）。
+	lockUnknown
+)
+
 // lockHeld 判断某个 lock 文件是否正被别的进程持有。
 //
 // 用 flock 而不是文件修改时间：mtime 只能说明「最近写过」，
 // 一个开着但没在写的会话 mtime 是旧的，而一个刚被读过的旧会话 mtime 也不会变。
 // 非阻塞独占锁拿不到，就说明有一个活着的进程正持有它。
-func lockHeld(path string) bool {
-	file, err := os.OpenFile(path, os.O_RDWR, 0)
+//
+// 用 O_RDONLY 而不是 O_RDWR：flock(2) 在 macOS/Linux 上对只读 fd 同样有效，
+// 而 O_RDWR 会在只读目录、别人拥有的 lock 文件、或被 chmod 0444 的文件上
+// 直接 EACCES —— 那种情况下我们仍然应该能正确判断，而不是误判成空闲。
+//
+// 语义：
+//   - ENOENT（没有 lock 文件）→ lockFree，没有 lock 文件就是没在用；
+//   - 拿到 LOCK_EX|LOCK_NB → lockFree，并立刻 LOCK_UN 释放；
+//   - EWOULDBLOCK / EAGAIN → lockBusy；
+//   - 其它任何错误（打开失败、flock 失败）→ lockUnknown。
+func lockHeld(path string) lockState {
+	file, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
-		return false
+		if errors.Is(err, os.ErrNotExist) {
+			return lockFree
+		}
+		// EACCES / EPERM / EIO / …：不是「没人用」，是「看不出来」。
+		return lockUnknown
 	}
 	defer file.Close()
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return errors.Is(err, unix.EWOULDBLOCK)
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return lockBusy
+		}
+		return lockUnknown
 	}
 	_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
-	return false
+	return lockFree
+}
+
+// activeFromLock 把三态 lock 判断映射到 session.Session.Active。
+//
+// Active 只表达「可能正在被使用」，所以 lockUnknown 取保守值 true：
+// 宁可多提示一次「使用中」，也不要让用户误删一个正在用的会话。
+func activeFromLock(state lockState) bool {
+	return state != lockFree
+}
+
+// sessionLockState 合并一个会话可能带的多把 lock 文件
+// （文件型会话是 `{id}.lock` 与 `session.lock`，目录型只有 `session.lock`）。
+//
+// 越「忙」越优先：任意一把 busy → busy；否则任意一把 unknown → unknown；
+// 全部 free（含全部不存在）→ free。这条顺序保证 unknown 不会被另一把
+// 明确的 free 覆盖成「空闲」——保守方向只增不减。
+func sessionLockState(paths ...string) lockState {
+	state := lockFree
+	for _, path := range paths {
+		switch lockHeld(path) {
+		case lockBusy:
+			return lockBusy
+		case lockUnknown:
+			state = lockUnknown
+		}
+	}
+	return state
 }
 
 // applyAssoc 把「与会话同名的旁挂产物」挂到这条会话的删除清单上。
