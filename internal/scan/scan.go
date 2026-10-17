@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -335,6 +336,26 @@ func forEachFile(files []string, workers int, fn func(i int, path string)) {
 	wg.Wait()
 }
 
+// statSkipNotice 把「文件 Stat 失败」分类成该静默还是该告诉用户。
+//
+// glob 与 Stat 之间被删（ErrNotExist）是正常竞态，目录也不是会话文件，两者
+// 保持静默。其它错误（EACCES/EPERM、坏符号链接、iCloud 未下载、IO 错）说明
+// 文件真实存在却读不到 —— 结果里少了几条会话而没有任何解释，用户只能以为
+// 「本来就没有」。同一类原因聚合一条，正文带上首例路径与原始错误。
+func statSkipNotice(path string, err error) (scanNotice, bool) {
+	if err == nil || errors.Is(err, fs.ErrNotExist) {
+		return scanNotice{}, false
+	}
+	kind := "io"
+	if errors.Is(err, fs.ErrPermission) {
+		kind = "permission"
+	}
+	return scanNotice{
+		key:  "stat:" + kind,
+		text: fmt.Sprintf("有文件因权限/IO 无法读取（首例：%s）：%v", path, err),
+	}, true
+}
+
 // scanFiles 处理「一个文件 = 一条会话」的两种形态（jsonl / json）。
 func scanFiles(spec catalog.Spec, home string, store catalog.Store, jsonl bool) ([]session.Session, error) {
 	files := fsx.Glob(home, store.Glob)
@@ -350,9 +371,16 @@ func scanFiles(spec catalog.Spec, home string, store catalog.Store, jsonl bool) 
 	slots := make([]fileSlot, len(files))
 	forEachFile(files, scanWorkers, func(i int, file string) {
 		info, err := os.Stat(file)
-		if err != nil || info.IsDir() {
-			// 现状语义：Stat 失败（含 glob 与 Stat 之间的删除、坏符号链接）
-			// 和目录都静默跳过，不中断其它文件的解析。
+		if err != nil {
+			// 目录不是会话文件，Stat 失败也分两类：ENOENT 是 glob 与 Stat
+			// 之间的正常竞态；权限/IO 错误意味着文件真实存在却读不到，用户
+			// 只会看到「少了几个会话」，必须留一条提示。
+			if notice, ok := statSkipNotice(file, err); ok {
+				slots[i].notices = append(slots[i].notices, notice)
+			}
+			return
+		}
+		if info.IsDir() {
 			return
 		}
 		item, notices := buildFileSessionWithNotices(spec, home, store, file, info, jsonl)
@@ -584,6 +612,12 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 	}
 
 	var out []session.Session
+	// 逐行读失败与缺 ID 的行都保留「跳过、不中断整表」的原行为，但必须计数：
+	// 否则用户只看到「少了几个会话」，没有任何线索。计数按库聚合，循环结束
+	// 后并入 notices。
+	scanErrRows := 0
+	noIDRows := 0
+	var firstScanErr error
 	for rows.Next() {
 		values := make([]any, len(columns))
 		ptrs := make([]any, len(columns))
@@ -591,10 +625,15 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 			ptrs[i] = &values[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
+			scanErrRows++
+			if firstScanErr == nil {
+				firstScanErr = err
+			}
 			continue
 		}
 		id := stringValue(pick(values, idChoice.index))
 		if id == "" {
+			noIDRows++
 			continue
 		}
 		item := session.Session{
@@ -618,6 +657,17 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 		item.Snippet = item.Project
 		applyAssoc(home, home, store.Assoc, id, &item, &notices)
 		out = append(out, item)
+	}
+	if scanErrRows > 0 || noIDRows > 0 {
+		detail := ""
+		if firstScanErr != nil {
+			detail = fmt.Sprintf("（首例：%v）", firstScanErr)
+		}
+		addNotice(&notices, scanNotice{
+			key: "sqlite:" + dbPath + ":rows",
+			text: fmt.Sprintf("SQLite 表 %s 有 %d 行因列类型无法读取、%d 行缺少可用 ID 被跳过%s",
+				store.Table, scanErrRows, noIDRows, detail),
+		})
 	}
 	// 迭代到一半超时/被占时 rows.Err() 才会说话；此时 out 里已有的行照样返回，
 	// mergeStore 会把它们收下并把错误记进 AgentResult.Err（见 partial_test.go）。
