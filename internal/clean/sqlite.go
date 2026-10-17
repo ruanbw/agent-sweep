@@ -3,6 +3,8 @@ package clean
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -193,13 +195,28 @@ func (c *Cleaner) deleteSQLiteSessions(
 	}
 }
 
-// sqliteDSN 统一 DSN 形态。
+// openDSN 拼出写连接（备份 checkpoint / 删行 / VACUUM）的 DSN。
+//
+// 路径只做 EscapedPath（空格 → %20，`?`、`#`、`%` 也一并转义），绝不把裸路径
+// 直接拼进 `file:` URI：modernc 驱动把 `file:` 开头的 DSN 当 URI 解析，而 `?`
+// 和 `#` 在 macOS 上是完全合法的文件名字符。裸拼会让 URI 被截断或改变语义 ——
+// 轻则打不开（用户看到「0 条会话」或删除失败），重则打开到另一个文件、改动
+// 与预期不符的库，这对清理工具是数据安全问题。
+//
+// 写法与 internal/scan、internal/probe 中的同名逻辑对齐（只转义 path，不用
+// url.URL.String() 生成 file:/// 三斜杠形态）；本包各留一份，不跨包导出。
 //
 // busy_timeout 不是可选项：Agent 自己往往正开着库（Zed、VS Code 都是常驻进程），
 // 没有等待就会随机报 database is locked，用户看到的是「有时能删有时不能」。
-// mode=ro 只给只读场景用；删除必须可写，绝不能顺手带上。
+func openDSN(path string) string {
+	escaped := (&url.URL{Path: filepath.ToSlash(path)}).EscapedPath()
+	return "file:" + escaped + "?_pragma=busy_timeout(2000)"
+}
+
+// sqliteDSN 统一 DSN 形态；readonly 只给只读场景用，删除必须可写，绝不能
+// 顺手带上 mode=ro。转义由 openDSN 负责，这里只追加只读开关。
 func sqliteDSN(path string, readonly bool) string {
-	dsn := "file:" + path + "?_pragma=busy_timeout(2000)"
+	dsn := openDSN(path)
 	if readonly {
 		dsn += "&mode=ro"
 	}
