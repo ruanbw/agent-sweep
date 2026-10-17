@@ -453,8 +453,11 @@ func bundleVersion(appDir string) (string, error) {
 // replaceBundle 用「先复制到旁边、校验通过、再两次 rename 换位」的顺序替换。
 //
 // 直接把新包复制到目标路径，中途崩溃/休眠会留下一个半新半旧、点开就崩的包；
-// 先落到 target.new-* 再换位，崩溃窗口只剩两个 rename（文件系统层面近似原子），
-// 最坏情况是目标缺失、旁边留着 target.old-*/target.new-*，可以手工恢复。
+// 先落到 target.new-* 再换位，崩溃窗口只剩两个 rename（文件系统层面近似原子）。
+// 换位由 swapBundle 负责：它把「第二次 rename 失败就把旧包放回原位」当作硬约束，
+// 所以本函数返回错误时，目标位置不会是一个空洞。进程恰好在这两次 rename 之间
+// 被杀死时函数没有机会回滚，仍会留下 target.old-*，需要手工移回 —— 那是崩溃，
+// 不是可处理的错误返回路径。
 func replaceBundle(newApp, target string, progress ProgressFunc) error {
 	parent := filepath.Dir(target)
 	if err := ensureWritable(parent); err != nil {
@@ -463,6 +466,8 @@ func replaceBundle(newApp, target string, progress ProgressFunc) error {
 	stamp := time.Now().UnixNano()
 	stagedPath := fmt.Sprintf("%s.new-%d", target, stamp)
 	oldPath := fmt.Sprintf("%s.old-%d", target, stamp)
+	// stagedPath 只是刚复制出来的副本，失败时清掉它不会丢用户数据；即使删不掉，
+	// 也不影响「旧包还在」这个不变式，因此这里的错误可以忽略。
 	defer os.RemoveAll(stagedPath)
 
 	progress(94, "复制新版本")
@@ -473,20 +478,59 @@ func replaceBundle(newApp, target string, progress ProgressFunc) error {
 		return fmt.Errorf("新版本校验失败：%w", err)
 	}
 
-	if err := os.Rename(target, oldPath); err != nil {
-		return fmt.Errorf("移开旧版本失败：%w", err)
+	if err := swapBundle(target, stagedPath, oldPath, os.Rename); err != nil {
+		return err
 	}
-	if err := os.Rename(stagedPath, target); err != nil {
-		if rollbackErr := os.Rename(oldPath, target); rollbackErr != nil {
-			return fmt.Errorf("换上新的版本失败：%v；旧版本回滚失败，原包保留在 %s：%v", err, oldPath, rollbackErr)
-		}
-		return fmt.Errorf("换上新的版本失败，已回滚到旧版本：%w", err)
-	}
-	_ = os.RemoveAll(oldPath)
+	// 新包已经就位，旧包清不掉也不该回滚（回滚会再造一个空窗），但必须上报。
+	cleanupErr := removeOldBundle(oldPath)
 
 	progress(98, "清理隔离属性")
 	_ = exec.Command("xattr", "-dr", "com.apple.quarantine", target).Run()
 	ensureSignature(target)
+
+	return cleanupErr
+}
+
+// renameFunc 让测试可以注入「第二次换位失败」这类真实环境难以构造的错误。
+type renameFunc func(oldpath, newpath string) error
+
+// swapBundle 完成两次 rename 换位，并把「目标位置不能为空」当作硬约束。
+//
+// 第一次 rename 失败时目标原样未动；第二次失败时无条件把 oldPath 还原回 target。
+// 还原也失败时不再假装成功，而是把旧包的实际路径写进错误，让用户能手动救回来。
+func swapBundle(target, stagedPath, oldPath string, rename renameFunc) error {
+	if err := rename(target, oldPath); err != nil {
+		return fmt.Errorf("移开旧版本失败，%s 仍是旧版本：%w", target, err)
+	}
+	if err := rename(stagedPath, target); err != nil {
+		restoreErr := rename(oldPath, target)
+		// rename 返回 nil 仍要确认目标真的回来了：这条不变式不能只靠返回值相信，
+		// 否则注入实现（或未来的包装）说谎时目标会悄悄留空。
+		if restoreErr == nil {
+			if info, statErr := os.Stat(target); statErr != nil {
+				restoreErr = statErr
+			} else if !info.IsDir() {
+				restoreErr = fmt.Errorf("%s 不是目录", target)
+			}
+		}
+		if restoreErr != nil {
+			return fmt.Errorf("换上新的版本失败：%w；把旧版本还原到 %s 也失败：%w。旧版本完整保留在 %s，请手动把它移回 %s",
+				err, target, restoreErr, oldPath, target)
+		}
+		return fmt.Errorf("换上新的版本失败，已把旧版本从 %s 还原到 %s：%w", oldPath, target, err)
+	}
+	return nil
+}
+
+// removeOldBundle 删除换位成功后留下的旧包。
+//
+// 不能 `_ = os.RemoveAll(oldPath)`：删除失败意味着磁盘上多留一份完整的旧应用，
+// 调用方需要知道「新版本已就位，但旧包清不掉、它在哪」。本项目没有 logger，
+// 所以把错误并入返回值，而不是静默吞掉。
+func removeOldBundle(oldPath string) error {
+	if err := os.RemoveAll(oldPath); err != nil {
+		return fmt.Errorf("新版本已就位，但删除旧版本失败，旧包仍保留在 %s：%w", oldPath, err)
+	}
 	return nil
 }
 
