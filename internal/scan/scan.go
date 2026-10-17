@@ -32,6 +32,17 @@ import (
 // HeadBytes 是抽标题时的首轮读取量。真正要不要多读由 session.ReadMeta 决定。
 const HeadBytes = 64 * 1024
 
+// 文件型 Store 的 glob 预算。
+//
+// 正常 Agent 的会话树最多几千个文件、十几层目录，100k 条 / 64 层留了足够余量；
+// 但 glob 来自声明（内置、POST /api/adapters 的自定义 spec、指纹建议），一个
+// 指向整个 home 甚至数据根的 `**` 没有上限就会让每次扫描遍历整棵树。超出预算
+// 的结果会被截断，并通过 notice 告诉用户 —— 静默少几条会话是最难排查的那类问题。
+const (
+	globEntryLimit = 100_000
+	globDepthLimit = 64
+)
+
 // uuidAtEnd 匹配文件名末尾的 uuid。只取末尾：前面可能是时间戳或产品前缀。
 var uuidAtEnd = regexp.MustCompile(`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$`)
 
@@ -356,9 +367,26 @@ func statSkipNotice(path string, err error) (scanNotice, bool) {
 	}, true
 }
 
+// globStorePaths 按预算展开一个 Store 的 glob，并在截断时回一条 notice。
+//
+// 截断必须可见：用户看到的是「少了几条会话」，而不是「某个自定义适配器的
+// glob 写得太宽」。key 按 pattern 去重，同一 pattern 在同一 Agent 里只报一次。
+func globStorePaths(home string, store catalog.Store) ([]string, []scanNotice) {
+	paths, truncated := fsx.GlobBounded(home, store.Glob, globEntryLimit, globDepthLimit)
+	if !truncated {
+		return paths, nil
+	}
+	return paths, []scanNotice{{
+		key: "glob:" + store.Glob,
+		text: fmt.Sprintf(
+			"glob %q 的结果因遍历预算被截断（上限 %d 条 / %d 层），可能漏掉会话；请检查自定义适配器的 glob 是否过大",
+			store.Glob, globEntryLimit, globDepthLimit),
+	}}
+}
+
 // scanFiles 处理「一个文件 = 一条会话」的两种形态（jsonl / json）。
 func scanFiles(spec catalog.Spec, home string, store catalog.Store, jsonl bool) ([]session.Session, error) {
-	files := fsx.Glob(home, store.Glob)
+	files, globNotices := globStorePaths(home, store)
 	// 用指针槽位而不是 make([]session.Session, len(files))：后者会为几万个
 	// 文件先分配一整片零值结构体，而真正解析成功的只是其中一部分。空槽位
 	// 也保留了「按下标写、按下标读」的顺序语义。
@@ -389,6 +417,9 @@ func scanFiles(spec catalog.Spec, home string, store catalog.Store, jsonl bool) 
 
 	out := make([]session.Session, 0, len(slots))
 	var notices []scanNotice
+	for _, notice := range globNotices {
+		addNotice(&notices, notice)
+	}
 	for _, slot := range slots {
 		if slot.item != nil && slot.item.ID != "" {
 			out = append(out, *slot.item)
@@ -473,7 +504,7 @@ func scanDirs(spec catalog.Spec, home string, store catalog.Store) ([]session.Se
 type dirSessionBuilder func(spec catalog.Spec, home string, store catalog.Store, dir string, info os.FileInfo) (session.Session, []scanNotice)
 
 func scanDirsWith(spec catalog.Spec, home string, store catalog.Store, build dirSessionBuilder) ([]session.Session, error) {
-	entries := fsx.Glob(home, store.Glob)
+	entries, globNotices := globStorePaths(home, store)
 	// 与 scanFiles 相同的指针槽位：只有真正处理成功的目录才占一个结果，
 	// 空槽位保留「按下标写、按下标读」的顺序语义。
 	type dirSlot struct {
@@ -494,6 +525,9 @@ func scanDirsWith(spec catalog.Spec, home string, store catalog.Store, build dir
 
 	out := make([]session.Session, 0, len(slots))
 	var notices []scanNotice
+	for _, notice := range globNotices {
+		addNotice(&notices, notice)
+	}
 	for _, slot := range slots {
 		if slot.item != nil {
 			out = append(out, *slot.item)
@@ -550,6 +584,30 @@ func buildDirSession(spec catalog.Spec, home string, store catalog.Store, dir st
 	return item, notices
 }
 
+// resolveStorePath 把 Store 里声明的相对路径解析到数据根内。
+//
+// store.DB 来自声明：内置条目没问题，但 POST /api/adapters 接受未校验的自定义
+// spec，写 `../../foo.db` 时 filepath.Join 会把 `..` Clean 掉，直接拼接等于允许
+// 以只读方式打开数据根之外的任意 SQLite（表名与行数会进扫描结果）。所以拼完
+// 必须再相对化校验一次，越界一律拒绝，连库都不打开。
+func resolveStorePath(home, rel string) (string, error) {
+	if rel == "" {
+		return "", errors.New("SQLite 库路径为空")
+	}
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("SQLite 库路径 %q 不能是绝对路径", rel)
+	}
+	path := filepath.Join(home, rel)
+	relative, err := filepath.Rel(home, path)
+	if err != nil {
+		return "", fmt.Errorf("SQLite 库路径 %q 无法解析: %w", rel, err)
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", fmt.Errorf("SQLite 库路径 %q 越出数据根 %s", rel, home)
+	}
+	return path, nil
+}
+
 // scanSQLite 读表里的会话行。
 //
 // 用 `SELECT *` 而不是拼列名：各版本的表结构会加减列，硬编码列名会让
@@ -561,7 +619,10 @@ func buildDirSession(spec catalog.Spec, home string, store catalog.Store, dir st
 // 第一层是 DSN 里的 busy_timeout（等锁的时长），第二层是这里的 ctx（查询总时长）。
 // 超时不算「0 条会话」：带着已读到的行一起返回错误，UI 才能说清是哪个 Agent 超时。
 func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.Session, error) {
-	dbPath := filepath.Join(home, store.DB)
+	dbPath, err := resolveStorePath(home, store.DB)
+	if err != nil {
+		return nil, err
+	}
 	if !fsx.Exists(dbPath) {
 		return nil, nil
 	}

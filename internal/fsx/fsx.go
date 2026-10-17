@@ -19,30 +19,69 @@ import (
 //
 // 只返回真实存在的路径，按字典序排 —— 扫描结果的顺序要稳定，
 // 否则同一个会话在两次扫描之间会换位置，用户勾选到的东西会跳。
+//
+// 这是不限预算的旧入口：内部就是 GlobBounded(root, pattern, 0, 0) 并忽略
+// truncated，既有调用点的行为一个字节都不变。
 func Glob(root, pattern string) []string {
+	paths, _ := GlobBounded(root, pattern, 0, 0)
+	return paths
+}
+
+// GlobBounded 同 Glob，但限制遍历产出数与 `**` 递归深度。
+//
+// 预算存在的理由：pattern 可以来自用户自定义适配器（POST /api/adapters 接受
+// 未校验的 spec）或指纹建议，一个指向 home 甚至数据根的 `**` 没有上限时会
+// 让每次扫描遍历整棵树。调用方拿到 truncated=true 必须告诉用户 —— 否则扫描
+// 结果看起来只是「少了几个会话」。
+//
+// maxEntries/maxDepth 传 0 表示不限制。达到任一上限时立即停止展开，已收集
+// 的结果照常返回并排序；两者都写在返回值里，不用全局状态。
+func GlobBounded(root, pattern string, maxEntries, maxDepth int) (paths []string, truncated bool) {
 	if root == "" {
-		return nil
+		return nil, false
 	}
 	pattern = filepath.ToSlash(strings.TrimPrefix(pattern, "./"))
 	segments := strings.Split(pattern, "/")
-	var out []string
-	walk(root, segments, 0, &out)
-	sortStrings(out)
-	return out
+	state := &globState{maxEntries: maxEntries, maxDepth: maxDepth}
+	state.walk(root, segments, 0, 0)
+	sortStrings(state.out)
+	return state.out, state.truncated
 }
 
-func walk(dir string, segments []string, index int, out *[]string) {
+// globState 是一次有预算遍历的可变状态。
+//
+// 深度只对 `**` 的递归下探计数：`*` 是单段匹配，不增加层数。
+type globState struct {
+	out        []string
+	maxEntries int
+	maxDepth   int
+	truncated  bool
+}
+
+func (s *globState) walk(dir string, segments []string, index, depth int) {
+	if s.truncated {
+		return
+	}
 	if index == len(segments) {
-		*out = append(*out, dir)
+		// maxEntries 限的是「产出结果数」：第 maxEntries+1 条出现时停下并
+		// 标记截断，因此返回的条数恰好等于上限。
+		if s.maxEntries > 0 && len(s.out) >= s.maxEntries {
+			s.truncated = true
+			return
+		}
+		s.out = append(s.out, dir)
 		return
 	}
 	seg := segments[index]
 	switch seg {
 	case "", ".":
-		walk(dir, segments, index+1, out)
+		s.walk(dir, segments, index+1, depth)
 	case "**":
 		// `**` 可以匹配零层，所以先走一次当前层；再逐个子目录往下。
-		walk(dir, segments, index+1, out)
+		s.walk(dir, segments, index+1, depth)
+		if s.truncated {
+			return
+		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			return
@@ -51,7 +90,16 @@ func walk(dir string, segments []string, index int, out *[]string) {
 			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 				continue
 			}
-			walk(filepath.Join(dir, entry.Name()), segments, index, out)
+			// 还有可下探的目录却已经到深度上限：这是真实的截断，不是「恰好
+			// 没有更深」。没有子目录时不会走到这里，也就不会误报。
+			if s.maxDepth > 0 && depth >= s.maxDepth {
+				s.truncated = true
+				return
+			}
+			s.walk(filepath.Join(dir, entry.Name()), segments, index, depth+1)
+			if s.truncated {
+				return
+			}
 		}
 	default:
 		entries, err := os.ReadDir(dir)
@@ -66,7 +114,10 @@ func walk(dir string, segments []string, index int, out *[]string) {
 			if err != nil || !ok {
 				continue
 			}
-			walk(filepath.Join(dir, entry.Name()), segments, index+1, out)
+			s.walk(filepath.Join(dir, entry.Name()), segments, index+1, depth)
+			if s.truncated {
+				return
+			}
 		}
 	}
 }
