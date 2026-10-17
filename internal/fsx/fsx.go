@@ -20,32 +20,61 @@ import (
 // 只返回真实存在的路径，按字典序排 —— 扫描结果的顺序要稳定，
 // 否则同一个会话在两次扫描之间会换位置，用户勾选到的东西会跳。
 //
-// 这是不限预算的旧入口：内部就是 GlobBounded(root, pattern, 0, 0) 并忽略
+// 这是不限预算的旧入口：内部就是 GlobBounded(root, pattern, 0, 0, 0) 并忽略
 // truncated，既有调用点的行为一个字节都不变。
 func Glob(root, pattern string) []string {
-	paths, _ := GlobBounded(root, pattern, 0, 0)
+	paths, _ := GlobBounded(root, pattern, 0, 0, 0)
 	return paths
 }
 
-// GlobBounded 同 Glob，但限制遍历产出数与 `**` 递归深度。
+// GlobTruncation 说明一次 GlobBounded 是为什么停下的。
+//
+// 三个维度的截断在 UI 上是同一类问题（结果不完整），但原因不同、处理方式也
+// 不同，所以要把「命中的是哪个预算」带出去；调用方通常仍共用一个提示 key。
+type GlobTruncation int
+
+const (
+	GlobNotTruncated GlobTruncation = iota
+	GlobTruncatedEntries
+	GlobTruncatedDepth
+	GlobTruncatedVisited
+)
+
+// GlobBounded 同 Glob，但限制遍历预算：产出结果数、`**` 递归深度、访问的目录项数。
 //
 // 预算存在的理由：pattern 可以来自用户自定义适配器（POST /api/adapters 接受
 // 未校验的 spec）或指纹建议，一个指向 home 甚至数据根的 `**` 没有上限时会
 // 让每次扫描遍历整棵树。调用方拿到 truncated=true 必须告诉用户 —— 否则扫描
 // 结果看起来只是「少了几个会话」。
 //
-// maxEntries/maxDepth 传 0 表示不限制。达到任一上限时立即停止展开，已收集
-// 的结果照常返回并排序；两者都写在返回值里，不用全局状态。
-func GlobBounded(root, pattern string, maxEntries, maxDepth int) (paths []string, truncated bool) {
+// 三维各有分工，缺一不可：
+//   - maxEntries 限「产出结果条数」，防的是匹配很多的结果集；
+//   - maxDepth 限 `**` 的下探层数，防的是深目录链；
+//   - maxVisited 限「访问过的目录项数」（每次 os.ReadDir 返回的 entry 都算
+//     一个，目录项本身也算）。没有它，一个一条都不匹配的宽 glob
+//     （`**/nomatch/*.x`）仍会对单层超大目录做一次全量 ReadDir。
+//
+// 任传 0 表示该维不限制。达到任一上限时立即停止展开，已收集的结果照常返回
+// 并排序；状态都在返回值里，不用全局变量。
+func GlobBounded(root, pattern string, maxEntries, maxDepth, maxVisited int) (paths []string, truncated bool) {
+	paths, stop := GlobBoundedStop(root, pattern, maxEntries, maxDepth, maxVisited)
+	return paths, stop != GlobNotTruncated
+}
+
+// GlobBoundedStop 与 GlobBounded 相同，但把截断原因也带回来。
+//
+// 需要区分「结果太多 / 目录太深 / 单层太宽」的调用方用这个；只有二值判断的
+// 调用方用 GlobBounded 即可。
+func GlobBoundedStop(root, pattern string, maxEntries, maxDepth, maxVisited int) (paths []string, stop GlobTruncation) {
 	if root == "" {
-		return nil, false
+		return nil, GlobNotTruncated
 	}
 	pattern = filepath.ToSlash(strings.TrimPrefix(pattern, "./"))
 	segments := strings.Split(pattern, "/")
-	state := &globState{maxEntries: maxEntries, maxDepth: maxDepth}
+	state := &globState{maxEntries: maxEntries, maxDepth: maxDepth, maxVisited: maxVisited}
 	state.walk(root, segments, 0, 0)
 	sortStrings(state.out)
-	return state.out, state.truncated
+	return state.out, state.stop
 }
 
 // globState 是一次有预算遍历的可变状态。
@@ -55,18 +84,39 @@ type globState struct {
 	out        []string
 	maxEntries int
 	maxDepth   int
-	truncated  bool
+	maxVisited int
+	visited    int
+	stop       GlobTruncation
+}
+
+func (s *globState) truncated() bool { return s.stop != GlobNotTruncated }
+
+// readDir 读一层目录并计入访问预算。
+//
+// 预算按「看到的目录项数」算，而不是按匹配结果：一条都不匹配的超宽目录也会
+// 在这里被截住。读到一半出错时直接放弃这一层，不计入 visited。
+func (s *globState) readDir(dir string) ([]os.DirEntry, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, false
+	}
+	s.visited += len(entries)
+	if s.maxVisited > 0 && s.visited > s.maxVisited {
+		s.stop = GlobTruncatedVisited
+		return nil, false
+	}
+	return entries, true
 }
 
 func (s *globState) walk(dir string, segments []string, index, depth int) {
-	if s.truncated {
+	if s.truncated() {
 		return
 	}
 	if index == len(segments) {
 		// maxEntries 限的是「产出结果数」：第 maxEntries+1 条出现时停下并
 		// 标记截断，因此返回的条数恰好等于上限。
 		if s.maxEntries > 0 && len(s.out) >= s.maxEntries {
-			s.truncated = true
+			s.stop = GlobTruncatedEntries
 			return
 		}
 		s.out = append(s.out, dir)
@@ -79,11 +129,11 @@ func (s *globState) walk(dir string, segments []string, index, depth int) {
 	case "**":
 		// `**` 可以匹配零层，所以先走一次当前层；再逐个子目录往下。
 		s.walk(dir, segments, index+1, depth)
-		if s.truncated {
+		if s.truncated() {
 			return
 		}
-		entries, err := os.ReadDir(dir)
-		if err != nil {
+		entries, ok := s.readDir(dir)
+		if !ok {
 			return
 		}
 		for _, entry := range entries {
@@ -93,17 +143,17 @@ func (s *globState) walk(dir string, segments []string, index, depth int) {
 			// 还有可下探的目录却已经到深度上限：这是真实的截断，不是「恰好
 			// 没有更深」。没有子目录时不会走到这里，也就不会误报。
 			if s.maxDepth > 0 && depth >= s.maxDepth {
-				s.truncated = true
+				s.stop = GlobTruncatedDepth
 				return
 			}
 			s.walk(filepath.Join(dir, entry.Name()), segments, index, depth+1)
-			if s.truncated {
+			if s.truncated() {
 				return
 			}
 		}
 	default:
-		entries, err := os.ReadDir(dir)
-		if err != nil {
+		entries, ok := s.readDir(dir)
+		if !ok {
 			return
 		}
 		for _, entry := range entries {
@@ -115,7 +165,7 @@ func (s *globState) walk(dir string, segments []string, index, depth int) {
 				continue
 			}
 			s.walk(filepath.Join(dir, entry.Name()), segments, index+1, depth)
-			if s.truncated {
+			if s.truncated() {
 				return
 			}
 		}

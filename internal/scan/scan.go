@@ -38,9 +38,15 @@ const HeadBytes = 64 * 1024
 // 但 glob 来自声明（内置、POST /api/adapters 的自定义 spec、指纹建议），一个
 // 指向整个 home 甚至数据根的 `**` 没有上限就会让每次扫描遍历整棵树。超出预算
 // 的结果会被截断，并通过 notice 告诉用户 —— 静默少几条会话是最难排查的那类问题。
+//
+// globVisitedLimit 单独限「访问过的目录项数」：前两个预算都拦不住「一条都不
+// 匹配、但单层目录巨大」的宽 glob。50 万条的选择：正常会话树的访问量比这低
+// 两个数量级；超过多半是 `**` 打到了系统目录、缓存或家目录根 —— 这类遍历
+// 即使不截断也读不出会话，早停比等它扫完更有用。
 const (
-	globEntryLimit = 100_000
-	globDepthLimit = 64
+	globEntryLimit   = 100_000
+	globDepthLimit   = 64
+	globVisitedLimit = 500_000
 )
 
 // uuidAtEnd 匹配文件名末尾的 uuid。只取末尾：前面可能是时间戳或产品前缀。
@@ -370,17 +376,27 @@ func statSkipNotice(path string, err error) (scanNotice, bool) {
 // globStorePaths 按预算展开一个 Store 的 glob，并在截断时回一条 notice。
 //
 // 截断必须可见：用户看到的是「少了几条会话」，而不是「某个自定义适配器的
-// glob 写得太宽」。key 按 pattern 去重，同一 pattern 在同一 Agent 里只报一次。
+// glob 写得太宽」。key 按 pattern 去重，同一 pattern 在同一 Agent 里只报一次；
+// text 里写明命中的维度（结果太多 / 目录太深 / 单层太宽），用户才知道该改什么。
 func globStorePaths(home string, store catalog.Store) ([]string, []scanNotice) {
-	paths, truncated := fsx.GlobBounded(home, store.Glob, globEntryLimit, globDepthLimit)
-	if !truncated {
+	paths, stop := fsx.GlobBoundedStop(home, store.Glob, globEntryLimit, globDepthLimit, globVisitedLimit)
+	if stop == fsx.GlobNotTruncated {
 		return paths, nil
+	}
+	dimension := "遍历预算"
+	switch stop {
+	case fsx.GlobTruncatedEntries:
+		dimension = "结果条数上限"
+	case fsx.GlobTruncatedDepth:
+		dimension = "递归深度上限"
+	case fsx.GlobTruncatedVisited:
+		dimension = "访问目录项数上限"
 	}
 	return paths, []scanNotice{{
 		key: "glob:" + store.Glob,
 		text: fmt.Sprintf(
-			"glob %q 的结果因遍历预算被截断（上限 %d 条 / %d 层），可能漏掉会话；请检查自定义适配器的 glob 是否过大",
-			store.Glob, globEntryLimit, globDepthLimit),
+			"glob %q 的结果因%s被截断（上限：结果 %d 条 / 深度 %d 层 / 访问 %d 项），可能漏掉会话；请检查自定义适配器的 glob 是否过大",
+			store.Glob, dimension, globEntryLimit, globDepthLimit, globVisitedLimit),
 	}}
 }
 
