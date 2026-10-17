@@ -105,17 +105,20 @@ type Service struct {
 	// appDir 是应用自己的数据目录（备份 / journal / prefs）。
 	// 做成字段而不是到处调 catalog.AppDir()：测试要把它指向临时目录，
 	// 否则跑一次测试就会往开发者真实的 ~/Library 里写 journal。
-	appDir   string
-	prefs    Prefs
-	specs    []catalog.Spec
-	agents   []AgentView
-	sessions []session.Session
-	byUID    map[string]session.Session
-	scan     ScanStatus
-	scanning bool
-	cleaner  *clean.Cleaner
-	found    []probe.Candidate
-	icons    *iconStore
+	appDir string
+	// openCommand 执行系统的「打开」动作。生产环境指向 exec.Command，
+	// 测试换成记录器，才能断言被拒绝的路径根本没走到 open。
+	openCommand func(name string, args ...string) error
+	prefs       Prefs
+	specs       []catalog.Spec
+	agents      []AgentView
+	sessions    []session.Session
+	byUID       map[string]session.Session
+	scan        ScanStatus
+	scanning    bool
+	cleaner     *clean.Cleaner
+	found       []probe.Candidate
+	icons       *iconStore
 
 	// 更新相关的状态都在 update.go 里维护，这里只放字段：
 	// updater 在 NewService 之后不再改变，updateView / lastRelease 由 mu 保护。
@@ -135,10 +138,11 @@ type Service struct {
 func NewService(version string) *Service {
 	appDir := catalog.AppDir()
 	svc := &Service{
-		version: version,
-		appDir:  appDir,
-		prefs:   loadPrefs(appDir),
-		byUID:   map[string]session.Session{},
+		version:     version,
+		appDir:      appDir,
+		openCommand: openWithSystem,
+		prefs:       loadPrefs(appDir),
+		byUID:       map[string]session.Session{},
 		// Issues 给空切片而不是 nil：nil 会序列化成 null，
 		// 前端 `issues.length` 直接抛错 —— 契约里写的是数组，就得是数组。
 		scan:  ScanStatus{Status: "idle", Issues: []ScanIssue{}},
@@ -682,7 +686,13 @@ func (s *Service) handleReveal(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		return
 	}
-	if err := exec.Command("open", "-R", path).Run(); err != nil {
+	// Finder 只能显示本地路径；会话文件与应用数据目录之外的一律拒绝，
+	// 否则一个 .app/.command 路径就等于一次任意执行。
+	if !s.allowedLocalPath(path) {
+		writeError(w, http.StatusForbidden, "只能显示扫描结果或应用数据目录里的路径")
+		return
+	}
+	if err := s.runOpen("open", "-R", path); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -701,12 +711,122 @@ func (s *Service) handleOpen(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "只允许打开 GitHub 上的发布页")
 			return
 		}
+	} else if !s.allowedLocalPath(path) {
+		// 本地路径必须是扫描结果里的会话路径，或应用自己的数据目录。
+		// 这里不做「尽量放行」：open 会执行 .app/.command/.terminal。
+		writeError(w, http.StatusForbidden, "只能打开扫描结果或应用数据目录里的路径")
+		return
 	}
-	if err := exec.Command("open", path).Run(); err != nil {
+	if err := s.runOpen("open", path); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// allowedLocalPath 判断本地路径是否可以交给 `open`。
+//
+// 只允许两类根：
+//   - 扫描结果里会话实际占用的路径（s.sessions[].Paths，可能是文件或目录）；
+//   - 应用自己的数据目录（journal / 备份 / 日志），即 catalog.AppDir()。
+//
+// 必须同时满足字面路径与真实路径都在根内：只看字面路径，会话目录里的一个
+// symlink 就能把 /etc/passwd 带出去；只看真实路径，前缀相近的兄弟目录
+// （/home/a 与 /home/ab）又会被 strings.HasPrefix 误判。任一路径不存在也拒绝。
+func (s *Service) allowedLocalPath(path string) bool {
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	return allowedLocalPathIn(path, s.localPathRoots())
+}
+
+// localPathRoots 快照当前允许的根目录。复制一份再解锁：
+// 后面的 EvalSymlinks 是文件系统调用，不该在持有 s.mu 时做。
+func (s *Service) localPathRoots() []string {
+	s.mu.Lock()
+	roots := make([]string, 0, len(s.sessions)+2)
+	for _, item := range s.sessions {
+		roots = append(roots, item.Paths...)
+	}
+	appDir := s.appDir
+	s.mu.Unlock()
+
+	// 正常情况下 appDir 就是 catalog.AppDir()；两个都收，服务被测试换成
+	// 临时目录时应用自己的数据目录仍然可打开。
+	roots = append(roots, appDir, catalog.AppDir())
+
+	seen := make(map[string]bool, len(roots))
+	out := roots[:0]
+	for _, root := range roots {
+		if root == "" || !filepath.IsAbs(root) {
+			continue
+		}
+		clean := filepath.Clean(root)
+		if seen[clean] {
+			continue
+		}
+		seen[clean] = true
+		out = append(out, clean)
+	}
+	return out
+}
+
+// allowedLocalPathIn 是不碰 Service 状态的纯判断，便于单测。
+func allowedLocalPathIn(path string, roots []string) bool {
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	cleanPath := filepath.Clean(path)
+	resolvedPath, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		// 不存在（或中途有断链）的路径没有「打开」的意义，直接拒绝。
+		return false
+	}
+	resolvedPath = filepath.Clean(resolvedPath)
+
+	for _, root := range roots {
+		if root == "" || !filepath.IsAbs(root) {
+			continue
+		}
+		cleanRoot := filepath.Clean(root)
+		if !pathWithin(cleanRoot, cleanPath) {
+			continue
+		}
+		resolvedRoot, err := filepath.EvalSymlinks(cleanRoot)
+		if err != nil {
+			continue
+		}
+		if pathWithin(filepath.Clean(resolvedRoot), resolvedPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// pathWithin 用 filepath.Rel 判断 target 是否等于 root 或位于 root 之下。
+// 不用 strings.HasPrefix：/home/a 会错误地放行 /home/ab。
+func pathWithin(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil || filepath.IsAbs(rel) {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// runOpen 调用可注入的打开实现。openCommand 为空时回落到真实执行，
+// 但空 Service（测试里直接构造）不应该因此 panic。
+func (s *Service) runOpen(name string, args ...string) error {
+	if s.openCommand != nil {
+		return s.openCommand(name, args...)
+	}
+	return openWithSystem(name, args...)
+}
+
+func openWithSystem(name string, args ...string) error {
+	return exec.Command(name, args...).Run()
 }
 
 // allowedExternalURL 只放行 GitHub 域名。更新器的 pageUrl 来自发布元数据，
