@@ -172,6 +172,13 @@ func (c *Client) Install(ctx context.Context, release *Release, target, workDir 
 	if !strings.EqualFold(actual, expected) {
 		return InstallResult{}, fmt.Errorf("SHA-256 不匹配（期望 %s，实际 %s），已放弃安装", expected, actual)
 	}
+	// 这一步只证明了「下载到的字节 == 同一个发布声明的字节」，没有证明「是谁发布的」：
+	// checksums.txt 和 zip 来自同一个 Release，发布渠道被攻破时可以一起换掉。
+	//
+	// 将来若引入真正的发布者签名（Minisign/EdDSA，或 Developer ID），校验插在**这里**：
+	// 下载完成之后、extractApp 之前。此刻 archivePath 还是发布方签过的那份原始字节；
+	// 挪到解压之后就只能对解压结果再算一次哈希，证明的仍然只是「包内自洽」。
+	// 威胁模型见 docs/SECURITY.md。
 
 	progress(78, "解压")
 	extracted, err := extractApp(archivePath, filepath.Join(staging, "app"))
@@ -692,6 +699,27 @@ func removeQuarantine(appDir string, run commandFunc) error {
 // 我们发布的就是 ad-hoc 签名，重新签不会降低安全性；但少了这一步，
 // 被 ditto 之外的方式复制过的包会直接拒绝启动。
 // codesign 不可用时仍然跳过：没有工具就没有可做的事，这不是安装失败。
+//
+// 这里必须说清楚这一段的**边界**，免得后来者把「重签成功」读成「包可信」：
+//
+//   - ad-hoc 重签（--sign -）的唯一作用是让替换后的包还能运行。它给包贴的是本机
+//     临时身份，没有证书链、没有团队 ID，也不比替换前更可信。
+//   - codesign --verify 只回答「这个包的签名与内容自洽吗」。ad-hoc 签名同样能通过，
+//     所以它**不是**身份验证：任何拿到写权限的人都能生成一份能过的 ad-hoc 签名。
+//   - 产物未做 Apple 公证（notarization），因此 Gatekeeper 也给不出「发布者是谁」的
+//     结论；我们自己在 replaceBundle 里主动去掉了 com.apple.quarantine，等于放弃了
+//     这一层系统检查。
+//   - 真正的信任边界在别处：GitHub 账号 + 仓库写权限 + HTTPS，加上「zip 与
+//     checksums.txt 出自同一个 Release」这一条自洽性约束。它们证明的是「没有被
+//     第三方中途替换、也没有上传错包」，而不是「授权发布者就是我以为的那个人」。
+//     仓库或账号失守时，攻击者可以同时替换 zip 与 checksums.txt，这条链不会报警。
+//   - 若将来做发布者签名，校验点不在重签这里，而在 Install 里下载完成之后、
+//     解压之前的原始压缩包上（见那里的注释）。重签只处理「能不能启动」，
+//     与「该不该信任」是两件事，不要合并。
+//
+// 因此本函数刻意不增加任何「看起来更安全」的动作：多做一次 verify、多打印一句
+// 「签名有效」，只会让调用方误以为身份已经核验过。要提升保证，得换信任根
+// （Minisign/EdDSA 公钥，或 Developer ID + 公证），而不是在这里加料。
 func ensureSignature(appDir string) error {
 	if _, err := exec.LookPath("codesign"); err != nil {
 		return nil
