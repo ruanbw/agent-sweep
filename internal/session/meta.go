@@ -203,7 +203,12 @@ func readMetaDirNames(dir string) Meta {
 		// 明文 JSONL：Pi 的正文就是 session.jsonl（放在 run-N/ 下）。
 		// 以前只有 .json 与两个 .zstd 变体，导致这类会话标题一律退化成 uuid。
 		"session.jsonl",
-		"meta.json", "messages.json", "session.v4.jsonl.zstd", "session.jsonl.zstd",
+		// Grok 的目录型会话把标题放在 <workspace>/<id>/summary.json，正文是
+		// 同目录的 updates.jsonl（ACP 事件流，不含标题）。不认这个文件名，
+		// 标题只能退化成「会话 <uuid8>」。
+		"meta.json", "summary.json", "messages.json",
+		// 压缩变体固定放最后：解压比读明文贵，能明文拿到就不碰压缩包。
+		"session.v4.jsonl.zstd", "session.jsonl.zstd",
 	}
 	for _, name := range names {
 		file := filepath.Join(dir, name)
