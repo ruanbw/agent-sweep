@@ -300,7 +300,13 @@ func deleteInTx(tx *sql.Tx, store catalog.Store, ids []string) ([]journalRow, er
 // SQLite 的变量上限随版本变化（常见 999 / 32766）。一次删几千条会话时把全部
 // ID 塞进一条 SQL 会在编译期报 too many SQL variables；按 400 分段可以覆盖
 // 任何现代版本，又不需要引入 driver 私有的限制常量。
+//
+// 删之前先校验 target 真实存在（validateDeleteTarget）：DQS 会把写错的
+// "column" 当字符串字面量，SQL 本身不会报错。
 func execDelete(tx *sql.Tx, table, column string, ids []string) error {
+	if err := validateDeleteTarget(tx, table, column); err != nil {
+		return err
+	}
 	const chunk = 400
 	for start := 0; start < len(ids); start += chunk {
 		end := start + chunk
@@ -318,6 +324,53 @@ func execDelete(tx *sql.Tx, table, column string, ids []string) error {
 		if _, err := tx.Exec(query, args...); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validateDeleteTarget 确认 table 存在，且 column 真的是这张表的一列。
+//
+// 为什么必须显式校验：SQLite 默认开启「双引号字符串」兼容行为（DQS），
+// `DELETE FROM "t" WHERE "写错的列" IN (...)` 里的双引号标识符解析不到列时
+// 会被降级成字符串字面量，谓词恒假 —— 语句影响 0 行、不报错、事务照常提交。
+// 后果是主表删了、子表/索引没删，journal 里还记着一条指向不存在列的删除，
+// 撤销时无从恢复。这种静默失败比直接报错难查得多，所以在拼 SQL 之前把
+// 表名与列名对着 PRAGMA table_info 验一遍。
+//
+// PRAGMA 不支持参数占位，表名只能拼进语句；它来自 catalog 声明，按既有约定
+// 过 quoteIdent（与 execDelete 里的拼法一致）。
+func validateDeleteTarget(tx *sql.Tx, table, column string) error {
+	rows, err := tx.Query("PRAGMA table_info(" + quoteIdent(table) + ")")
+	if err != nil {
+		return fmt.Errorf("读取表 %s 的结构失败: %w", table, err)
+	}
+	defer rows.Close()
+
+	foundColumn := false
+	hasTable := false
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, ctype      string
+			dflt             any
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("读取表 %s 的列信息失败: %w", table, err)
+		}
+		hasTable = true
+		if name == column {
+			foundColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("读取表 %s 的列信息失败: %w", table, err)
+	}
+	// PRAGMA table_info 对不存在的表返回 0 行而不是报错，需要单独区分。
+	if !hasTable {
+		return fmt.Errorf("表 %s 不存在", table)
+	}
+	if !foundColumn {
+		return fmt.Errorf("表 %s 没有列 %s：声明写错会让 DELETE 静默影响 0 行", table, column)
 	}
 	return nil
 }
