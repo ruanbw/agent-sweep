@@ -341,7 +341,7 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 	}
 
 	for _, s := range fileSessions {
-		ok, err := c.deleteFileSession(s, home, trashRoot, trashErr, j, &res, writer)
+		ok, err := c.deleteFileSession(spec, s, home, trashRoot, trashErr, j, &res, writer)
 		if ok {
 			// 先记账再落盘：即使紧接着的写盘失败，Result 也能准确告诉上层
 			// 这条会话已经删掉了。
@@ -414,6 +414,7 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 // 每成功移走/删掉一个路径就立刻落一次 journal：崩溃发生在这里时，已经离开原位的
 // 文件仍然在账本里。写盘失败返回 error，调用方必须停止整批删除。
 func (c *Cleaner) deleteFileSession(
+	spec catalog.Spec,
 	s session.Session,
 	home, trashRoot string,
 	trashErr error,
@@ -438,6 +439,13 @@ func (c *Cleaner) deleteFileSession(
 		}
 	}
 	if bad {
+		return false, nil
+	}
+	// 路径都在数据根内还不够：还要能由这份 spec 的 Store/Assoc 声明解释。
+	// 声明在扫描之后被改过、或 Paths 被别处污染时，这里会整条拒绝，而不是
+	// 按一份解释不了的清单删数据。
+	if err := checkPathDeclared(spec, home, s); err != nil {
+		res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
 		return false, nil
 	}
 

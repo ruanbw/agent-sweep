@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -277,39 +276,11 @@ func storeForDBPath(spec catalog.Spec, home, dbPath string) (catalog.Store, bool
 		if store.Kind != "sqlite" || store.DB == "" {
 			continue
 		}
-		pattern := filepath.ToSlash(strings.TrimPrefix(store.DB, "./"))
-		if matchDBPattern(pattern, rel) {
+		if catalog.MatchGlob(store.DB, rel) {
 			return store, true
 		}
 	}
 	return catalog.Store{}, false
-}
-
-// matchDBPattern 判断相对库路径是否匹配声明，支持 `*` / `?` / `[]` 与 `**`。
-func matchDBPattern(pattern, rel string) bool {
-	return matchDBPatternParts(strings.Split(pattern, "/"), strings.Split(rel, "/"))
-}
-
-func matchDBPatternParts(pattern, rel []string) bool {
-	if len(pattern) == 0 {
-		return len(rel) == 0
-	}
-	if pattern[0] == "**" {
-		for i := 0; i <= len(rel); i++ {
-			if matchDBPatternParts(pattern[1:], rel[i:]) {
-				return true
-			}
-		}
-		return false
-	}
-	if len(rel) == 0 {
-		return false
-	}
-	ok, err := path.Match(pattern[0], rel[0])
-	if err != nil || !ok {
-		return false
-	}
-	return matchDBPatternParts(pattern[1:], rel[1:])
 }
 
 func containsGlobMeta(pattern string) bool {
