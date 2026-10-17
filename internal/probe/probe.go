@@ -34,6 +34,11 @@ type Candidate struct {
 	Bytes        int64        `json:"bytes"`
 	Evidence     []string     `json:"evidence"`
 	Suggested    catalog.Spec `json:"suggested"`
+
+	// sizeTruncated 表示 Bytes 只是「至少这么大」的下界：体积统计在预算内
+	// 被提前截断，或整个扫描的时间已经用尽。不导出以保持 JSON 契约不变，
+	// 包内逻辑和测试可以直接读取。
+	sizeTruncated bool
 }
 
 const (
@@ -41,7 +46,7 @@ const (
 	headBytes = 8 * 1024
 
 	// 单个候选最多报 2GB：UI 只需要量级，真正删除时还会重新统计；
-	// 而 fsx.Size 对大目录是无上限递归，不能让它拖垮发现页。
+	// 体积统计本身也带条目/时间预算，不必把巨大目录量到精确值。
 	maxCandidateBytes = int64(2 << 30)
 
 	// 0.35 是「至少命中一条主指纹」的分数线：
@@ -52,6 +57,20 @@ const (
 
 	// 3 秒目标里给最后的体积统计/排序留 ~400ms。
 	scanBudget = 2600 * time.Millisecond
+
+	// 体积统计的全局条目预算。候选最多 20 个，200_000 条分下来平均每个
+	// 约 1 万条，足够把正常的会话目录（几百到几千文件）量准；而 20 万次
+	// Lstat/ReadDir 在本机通常是几十毫秒量级，不会吃光最后 400ms 的收尾
+	// 窗口。没有这个上限时，单个几十万文件的目录就能让 3 秒硬预算失效。
+	maxSizeEntries = 200_000
+
+	// 每访问 sizeTimeCheckEvery 个条目才调一次 time.Now()。单次 Lstat/ReadDir
+	// 是微秒级，512 条之内的时间误差可以忽略，又避免每条都取一次时钟。
+	sizeTimeCheckEvery = 512
+
+	// 每次从目录里批量读多少个 dirent。分块读而不是 os.ReadDir 一次性读，
+	// 预算耗尽时不会先把几十万条文件名全部读进内存。
+	sizeReadBatch = 256
 
 	// 单目录最多看 200 项。Electron 的 node_modules、日志目录动辄上万项，
 	// 真会话在不在前 200 项里对「发现」这个场景已经够用了。
@@ -222,6 +241,10 @@ type walker struct {
 	dbProbes   int
 	infos      []*dirInfo
 	infoByPath map[string]*dirInfo
+
+	// sizeBudget 是体积统计预算；nil 时 collect 按 deadline 与 maxSizeEntries
+	// 现建一份。抽成字段是为了让测试能注入一个更小的预算，Discover 不设置它。
+	sizeBudget *sizeBudget
 }
 
 func (w *walker) run() {
@@ -630,6 +653,11 @@ func (w *walker) collect() []Candidate {
 		protos = protos[:maxCandidates]
 	}
 
+	budget := w.sizeBudget
+	if budget == nil {
+		budget = &sizeBudget{remaining: maxSizeEntries, deadline: w.deadline}
+	}
+
 	candidates := make([]Candidate, 0, len(protos))
 	for _, proto := range protos {
 		evidence := mergeEvidence(proto.members)
@@ -638,11 +666,21 @@ func (w *walker) collect() []Candidate {
 			evidence = append([]string{proto.summary}, evidence...)
 		}
 		var size int64
+		truncated := false
 		if w.expired() {
 			// 宁可报 0 并说明原因，也不让发现页因为一个超大目录卡过 3 秒。
 			evidence = append(evidence, "扫描时间用尽，体积未统计")
+			truncated = true
 		} else {
-			size = fsx.Size(proto.path)
+			size, truncated = budget.size(proto.path)
+			if truncated {
+				// 放在最前面，避免被下面 10 条证据的上限裁掉。
+				note := "体积统计达到扫描预算，未能统计"
+				if size > 0 {
+					note = fmt.Sprintf("体积统计达到扫描预算，至少 %d 字节", size)
+				}
+				evidence = append([]string{note}, evidence...)
+			}
 			if size > maxCandidateBytes {
 				size = maxCandidateBytes
 				evidence = append(evidence, "目录体积超过 2GB，按 2GB 上限报告")
@@ -652,16 +690,111 @@ func (w *walker) collect() []Candidate {
 			evidence = evidence[:10]
 		}
 		candidates = append(candidates, Candidate{
-			Path:         proto.path,
-			Name:         proto.suggested.Name,
-			Confidence:   proto.confidence,
-			SessionCount: proto.sessionCount,
-			Bytes:        size,
-			Evidence:     evidence,
-			Suggested:    proto.suggested,
+			Path:          proto.path,
+			Name:          proto.suggested.Name,
+			Confidence:    proto.confidence,
+			SessionCount:  proto.sessionCount,
+			Bytes:         size,
+			Evidence:      evidence,
+			Suggested:     proto.suggested,
+			sizeTruncated: truncated,
 		})
 	}
 	return candidates
+}
+
+// sizeBudget 是一次 Discover 内所有候选目录共享的体积统计预算。
+//
+// 它替代 fsx.Size 的原因：fsx.Size 递归整棵树，没有深度/条目/时间上限，
+// 候选目录里只要有一个几十万文件的目录，单次调用就能把「3 秒硬预算」吃光
+// （候选数虽被 maxCandidates=20 截断，仍有 20 次机会）。这里每访问一个条目
+// 先扣预算，扣完或超过 deadline 立刻停下，已统计的部分照常返回。
+//
+// 语义与 fsx.Size 对齐：Lstat 不跟随符号链接，跳过隐藏项，只累加普通文件
+// 和目录。
+type sizeBudget struct {
+	remaining int       // 剩余可访问的条目数
+	deadline  time.Time // 整个 Discover 的硬截止时间
+	visited   int       // 已访问条目数，用于按间隔检查时间
+	truncated bool      // 最近一次 size 是否因预算/时间提前结束
+}
+
+// size 统计 root 的体积，并报告是否被截断。
+//
+// 截断时返回的 size 是「已统计部分」，也就是真实体积的下界（实际值只会
+// 更大或相等）。调用方可以安全地展示为「至少 N 字节」，但不能当成精确值；
+// 未截断的 false 才表示这是一次完整统计。
+func (b *sizeBudget) size(root string) (int64, bool) {
+	b.truncated = false
+	if b.remaining <= 0 || b.expired() {
+		// 时间已用尽时直接返回，一个条目都不遍历。
+		b.truncated = true
+		return 0, true
+	}
+	total := b.walk(root)
+	return total, b.truncated
+}
+
+func (b *sizeBudget) expired() bool {
+	return !b.deadline.IsZero() && time.Now().After(b.deadline)
+}
+
+// take 为访问一个条目扣预算；返回 false 表示应当停止遍历。
+// truncated 一旦置位，后续 take 全部失败，递归会在每一层尽快收敛。
+func (b *sizeBudget) take() bool {
+	if b.truncated || b.remaining <= 0 {
+		b.truncated = true
+		return false
+	}
+	b.remaining--
+	b.visited++
+	// 每 N 条才取一次时钟：time.Now + 比较的开销不该出现在每个 Lstat 旁边。
+	if b.visited%sizeTimeCheckEvery == 0 && b.expired() {
+		b.truncated = true
+		return false
+	}
+	return true
+}
+
+func (b *sizeBudget) walk(path string) int64 {
+	if !b.take() {
+		return 0
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0
+	}
+	if !info.IsDir() {
+		if info.Mode().IsRegular() {
+			return info.Size()
+		}
+		// 符号链接、设备文件等不跟随、不计入，和 fsx.Size 一致。
+		return 0
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+
+	var total int64
+	for {
+		entries, err := file.ReadDir(sizeReadBatch)
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			total += b.walk(filepath.Join(path, entry.Name()))
+			if b.truncated {
+				return total
+			}
+		}
+		if err != nil || len(entries) == 0 {
+			// io.EOF 是正常读完；其他读错误也保留已统计部分，与 fsx.Size 一致。
+			return total
+		}
+	}
 }
 
 // mergeSiblings 处理「同一父目录下每个子目录都是一条会话」的形态。
