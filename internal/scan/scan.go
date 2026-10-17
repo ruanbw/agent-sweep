@@ -6,6 +6,7 @@
 package scan
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -19,7 +20,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/ruanbw/agent-sweep/internal/catalog"
 	"github.com/ruanbw/agent-sweep/internal/fsx"
@@ -292,6 +294,12 @@ func scanDirs(spec catalog.Spec, home string, store catalog.Store) ([]session.Se
 //
 // 用 `SELECT *` 而不是拼列名：各版本的表结构会加减列，硬编码列名会让
 // 一个改名直接变成「扫描失败」。读出来再按配置的列名取值，取不到就退回候选列。
+//
+// 全程有**双重上限**，因为调用方是 6 路并发的 AllWithProgress：一个 Agent 的库
+// 被自己占着（Agent 常驻时很常见，比如它正开着写事务），没有上限就会让整次扫描
+// 永不返回，GUI 的扫描状态卡在 running，而 startScan 的幂等判断又拦住用户重试。
+// 第一层是 DSN 里的 busy_timeout（等锁的时长），第二层是这里的 ctx（查询总时长）。
+// 超时不算「0 条会话」：带着已读到的行一起返回错误，UI 才能说清是哪个 Agent 超时。
 func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.Session, error) {
 	dbPath := filepath.Join(home, store.DB)
 	if !fsx.Exists(dbPath) {
@@ -301,16 +309,18 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", sqliteDSN(dbPath))
+	db, err := sql.Open("sqlite", sqliteScanDSN(dbPath))
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 
-	rows, err := db.Query(fmt.Sprintf("SELECT * FROM %s", quoteIdent(store.Table)))
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteQueryTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s", quoteIdent(store.Table)))
 	if err != nil {
-		return nil, err
+		return nil, sqliteQueryError(dbPath, err)
 	}
 	defer rows.Close()
 	columns, err := rows.Columns()
@@ -363,7 +373,54 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 		applyAssoc(home, home, store.Assoc, id, &item)
 		out = append(out, item)
 	}
-	return out, rows.Err()
+	// 迭代到一半超时/被占时 rows.Err() 才会说话；此时 out 里已有的行照样返回，
+	// mergeStore 会把它们收下并把错误记进 AgentResult.Err（见 partial_test.go）。
+	return out, sqliteQueryError(dbPath, rows.Err())
+}
+
+// SQLite 扫描的两层时间上限。取值理由见下；两者必须一起看。
+const (
+	// sqliteBusyTimeout 是「等别的连接让出锁」的上限，写进 DSN。
+	//
+	// 1.5s 的选择：比 probe 的 500ms 宽 —— 探测只是判断「像不像会话库」，等不到
+	// 可以跳过；而扫描是主路径，Agent 正在写盘时多等一会儿，换回来的是完整会话
+	// 列表而不是「已安装 · 0 条」。但它必须明显小于 sqliteQueryTimeout：SQLite 的
+	// busy 等待是在锁重试里自旋的，驱动的 context 中断只在 VM 指令之间检查，
+	// 打断不了这段等待（实测 busy_timeout=10s + ctx=300ms 仍会等满 10s）。
+	// 所以真正封顶「被占」时长的是这个值，1.5s 足以覆盖一次正常写事务。
+	sqliteBusyTimeout = 1500 * time.Millisecond
+	// sqliteQueryTimeout 是一次 SELECT 的总上限（含上面那段等锁时间）。
+	//
+	// 取 4s：几万行的会话库在慢盘上通常 1s 内读完，4s 留足余量；而 6 路并发的
+	// 扫描里最坏也只多花 4s，GUI 的「扫描中」不会长期挂着，用户也不用重启应用
+	// 才能再点一次扫描。4s 落在 3–5s 的建议区间，且比 busy_timeout 大得多，
+	// 保证等锁失败时报的是「被占用」而不是含混的「超时」。
+	sqliteQueryTimeout = 4 * time.Second
+)
+
+// sqliteQueryError 给驱动错误补上中文上下文，并把「超时」与「库被占」分开。
+//
+// 这两种错误在 UI 里的含义不同：超时是这次没读完（重试可能就好），被占是
+// Agent 自己正开着库（多半要先退出那个 Agent）。两者都用 %w 包装，调用方仍可
+// errors.Is(err, context.DeadlineExceeded) 或 errors.As(err, *sqlite.Error) 判断。
+func sqliteQueryError(dbPath string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		// 扩展错误码的高位是细分原因（如 SQLITE_BUSY_SNAPSHOT），主码看低 8 位。
+		switch sqliteErr.Code() & 0xff {
+		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+			return fmt.Errorf("SQLite 库 %s 被其它进程占用（等待 %s 后仍读不到）: %w",
+				filepath.Base(dbPath), sqliteBusyTimeout, err)
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return fmt.Errorf("读取 SQLite 库 %s 超时（上限 %s）: %w",
+			filepath.Base(dbPath), sqliteQueryTimeout, err)
+	}
+	return fmt.Errorf("读取 SQLite 库 %s 失败: %w", filepath.Base(dbPath), err)
 }
 
 // sqliteDSN 拼出 `file:<path>?mode=ro&_pragma=query_only(1)`。
@@ -375,10 +432,21 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 //
 // 写法与 internal/probe 的 sqliteReadOnlyDSN 对齐（同样只转义 path、不用
 // url.URL.String() 生成 file:/// 三斜杠形态）；两个包各留一份，不跨包导出。
-// 本包不加 busy_timeout，那是另一条修复。
+// 扫描专用的 DSN 在 sqliteScanDSN 里额外追加 busy_timeout，这里保持只读四件套
+// 的最小形态（dsn_test.go 逐字节断言了这条输出）。
 func sqliteDSN(path string) string {
 	escaped := (&url.URL{Path: filepath.ToSlash(path)}).EscapedPath()
 	return "file:" + escaped + "?mode=ro&_pragma=query_only(1)"
+}
+
+// sqliteScanDSN 是扫描真正使用的 DSN：在 sqliteDSN 之后追加 busy_timeout。
+//
+// 单独一个函数而不是直接改 sqliteDSN，是因为后者被 dsn_test.go 逐字节断言，
+// 而 busy_timeout 只在「库正被 Agent 占着」的扫描场景里才有意义。driver 按
+// 顺序应用 _pragma 且会把 busy_timeout 排到最前，随后 query_only 落地，
+// 只读语义（mode=ro + query_only）一个不丢。
+func sqliteScanDSN(path string) string {
+	return sqliteDSN(path) + fmt.Sprintf("&_pragma=busy_timeout(%d)", sqliteBusyTimeout/time.Millisecond)
 }
 
 // sqliteTime 认现代c 驱动返回的几种时间形态。
