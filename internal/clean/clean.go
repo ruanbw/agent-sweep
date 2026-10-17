@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/ruanbw/agent-sweep/internal/catalog"
 	"github.com/ruanbw/agent-sweep/internal/fsx"
 	"github.com/ruanbw/agent-sweep/internal/session"
@@ -82,7 +84,76 @@ type Cleaner struct {
 // 删除会同时改正文、索引和 SQLite，撤销则按 journal 反向改回来；两者交错执行会
 // 产生谁都没法解释的中间态。桌面应用里删除是低频操作，串行化的代价可以忽略。
 // 它同时保证同一秒内的 batchID 分配不会互相踩。
+//
+// 但 sync.Mutex 只在**本进程内**有效：GUI 开着窗口时用户再跑一次
+// `agentsweep clean`，就是两个进程同时改同一份 backups/journal —— 一个可能把
+// 另一个正在写的 journal 覆盖掉。所以进程内锁之外还有一把跨进程文件锁
+// （acquireProcessLock），两者都在做任何破坏性动作之前取得。
 var opMu sync.Mutex
+
+// processLockTimeout 是等待另一个进程释放清理锁的上限。
+//
+// 删除一批会话通常是毫秒到几秒级（要移文件、改索引、偶尔 VACUUM）。5 秒足够盖住
+// 正常情况，又不至于让用户以为界面卡死。超时不算「可以继续」，而是明确失败。
+const processLockTimeout = 5 * time.Second
+
+// processLock 是跨进程互斥的持有凭据。
+//
+// flock 绑定在打开的文件描述符上，所以 fd 必须在整个临界区里一直持有：不能
+// Lock 一次就 Close，否则同一进程的第二个调用者会拿到另一把「锁」而互相绕过。
+type processLock struct {
+	file *os.File
+}
+
+// acquireProcessLock 在「清理数据根」上取排他 flock，最多等 processLockTimeout。
+//
+// 锁文件放在备份/journal 目录的**父目录**（正常即 AppDir）而不是 journal 目录里：
+//   - 它同时保护 backups 与 journal 两份数据，语义比「只锁账本」更准；
+//   - journal 目录本身可能因为权限问题不可写（那种情况下 Delete 应当失败，
+//     但不该被误报成「另一个进程正在清理」）。
+//
+// 调用方传的是 JournalDir，父目录由它推导；JournalDir 为空时退回当前目录。
+func acquireProcessLock(journalDir string) (*processLock, error) {
+	root := filepath.Dir(journalDir)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, fmt.Errorf("clean: 无法创建应用数据目录 %s: %w", root, err)
+	}
+	lockPath := filepath.Join(root, ".clean.lock")
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("clean: 无法打开清理锁 %s: %w", lockPath, err)
+	}
+
+	deadline := time.Now().Add(processLockTimeout)
+	for {
+		err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return &processLock{file: file}, nil
+		}
+		// EWOULDBLOCK 才是「别人占着」，其它错误（例如文件系统不支持 flock）
+		// 不能靠重试解决，直接报出来。
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			file.Close()
+			return nil, fmt.Errorf("clean: 无法获取清理锁 %s: %w", lockPath, err)
+		}
+		if time.Now().After(deadline) {
+			file.Close()
+			return nil, fmt.Errorf(
+				"clean: 另一个 AgentSweep 进程正在进行清理，等待 %s 后仍未获得锁；请等它结束后重试",
+				processLockTimeout)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// release 释放跨进程锁。释放失败只意味着进程退出时会自动放开，不值得中断调用方。
+func (l *processLock) release() {
+	if l == nil || l.file == nil {
+		return
+	}
+	_ = unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
+	_ = l.file.Close()
+}
 
 // New 构造 Cleaner。空字段走安全默认值：
 //   - Mode 默认 trash（宁可让用户去废纸篓捞，也不要一上来就不可逆）
@@ -186,6 +257,14 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 
 	opMu.Lock()
 	defer opMu.Unlock()
+
+	// 进程内锁拿到之后才去抢跨进程锁：同一进程的并发调用已经在 opMu 上排队，
+	// 不会各自去 flock 同一把锁而互相等待。
+	lock, err := acquireProcessLock(c.opts.JournalDir)
+	if err != nil {
+		return Result{Errors: []ItemError{}}, err
+	}
+	defer lock.release()
 
 	now := c.opts.Now()
 	batchID, err := c.reserveBatch(now)

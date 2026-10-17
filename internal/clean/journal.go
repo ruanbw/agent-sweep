@@ -150,6 +150,14 @@ func (c *Cleaner) Undo(batchID string) (UndoResult, error) {
 	opMu.Lock()
 	defer opMu.Unlock()
 
+	// 与 Delete 同一把跨进程锁：撤销会覆盖索引/数据库、把文件搬回原位，两个进程
+	// 同时撤同一批或一边删一边撤，都会留下谁也无法解释的中间态（R18）。
+	lock, err := acquireProcessLock(c.opts.JournalDir)
+	if err != nil {
+		return UndoResult{Errors: []string{}}, err
+	}
+	defer lock.release()
+
 	j, err := c.readJournal(batchID)
 	if err != nil {
 		return UndoResult{Errors: []string{}}, err
