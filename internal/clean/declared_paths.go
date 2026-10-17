@@ -33,7 +33,7 @@ func checkPathDeclared(spec catalog.Spec, home string, s session.Session) error 
 		mainDir = filepath.Dir(s.Paths[0])
 	}
 	for _, path := range s.Paths {
-		if pathDeclaredBySpec(spec, home, mainDir, s.ID, path) {
+		if pathDeclared(spec, home, mainDir, s.ID, path) {
 			continue
 		}
 		return fmt.Errorf(
@@ -41,6 +41,12 @@ func checkPathDeclared(spec catalog.Spec, home string, s session.Session) error 
 			path, spec.ID, declaredPatternExamples(spec))
 	}
 	return nil
+}
+
+// pathDeclared 判断单条路径能否被声明解释。deleteFileSession 与 deleteSidecars
+// 共用；调用方负责决定「spec 没有 Stores 时是否跳过」。
+func pathDeclared(spec catalog.Spec, home, mainDir, id, path string) bool {
+	return pathDeclaredBySpec(spec, home, mainDir, id, path)
 }
 
 // pathDeclaredBySpec 判断单条路径能否被声明解释。

@@ -186,15 +186,35 @@ func (c *Cleaner) deleteSQLiteSessions(
 		if len(plan.ids) == 0 || plan.backupErr != nil {
 			continue
 		}
+
+		// 先记账、后删行：把「这个库、这些表、这些 ID 将被删」写进 journal 并
+		// 落盘，再执行事务。进程如果死在事务提交之后、下一次落盘之前，账本里
+		// 已经有这个库的备份与计划，撤销仍能整库覆盖回去。
+		planned := plannedPlanRows(plan)
+		j.SQLite = append(j.SQLite, journalDB{DB: plan.path, Backup: plan.backup, Deletes: planned})
+		if err := j.save(); err != nil {
+			popLastJournalDB(j)
+			j.persistErr = err
+			return
+		}
+		journalBeforeActionHook()
+
 		db, err := sql.Open("sqlite", sqliteDSN(plan.path, false))
+		if err == nil {
+			db.SetMaxOpenConns(1)
+			err = db.Ping()
+		}
 		if err != nil {
 			plan.deleteErr = err
-			continue
-		}
-		db.SetMaxOpenConns(1)
-		if err := db.Ping(); err != nil {
-			plan.deleteErr = err
-			db.Close()
+			if db != nil {
+				db.Close()
+			}
+			// 库根本没被改：撤回刚预写的条目。
+			popLastJournalDB(j)
+			if saveErr := j.save(); saveErr != nil {
+				j.persistErr = saveErr
+				return
+			}
 			continue
 		}
 
@@ -208,8 +228,17 @@ func (c *Cleaner) deleteSQLiteSessions(
 		}
 		// 已提交的删除必须在继续之前落进 journal：多表 spec 里第二张表失败时，
 		// 第一张表的行已经真没了，不能因为整条计划被判失败就让撤销对它失明。
-		if len(plan.rows) > 0 {
-			j.SQLite = append(j.SQLite, journalDB{DB: plan.path, Backup: plan.backup, Deletes: plan.rows})
+		// 同时把预写的「计划」换成实际删掉的表/ID —— 不一致说明声明与实际不符，
+		// 以实际为准。
+		if plan.deleteErr != nil && len(plan.rows) == 0 {
+			popLastJournalDB(j)
+		} else {
+			j.SQLite[len(j.SQLite)-1].Deletes = plan.rows
+		}
+		if saveErr := j.save(); saveErr != nil {
+			j.persistErr = saveErr
+			db.Close()
+			return
 		}
 		if plan.deleteErr != nil {
 			db.Close()
@@ -254,7 +283,7 @@ func (c *Cleaner) deleteSQLiteSessions(
 		}
 		// 行删掉之后，把旁挂的正文目录也带走（Antigravity 的 brain/<id> 这类）。
 		// 失败只记账：行已经没了，留下目录是孤儿数据，但不影响「这条会话已删除」。
-		c.deleteSidecars(s, home, trashRoot, trashErr, j, res)
+		c.deleteSidecars(spec, s, home, trashRoot, trashErr, j, res)
 		res.Count++
 		addDeletedID(deleted, s)
 		addAgent(agents, s, spec)
@@ -536,8 +565,23 @@ func (c *Cleaner) trimSQLiteIndex(
 		return
 	}
 
+	// 先记账、后裁剪：预写「这个库的这张表将删这些 ID」并落盘，再动库。
+	planned := []journalRow{{Table: idx.Table, IDs: append([]string(nil), ids...)}}
+	j.SQLite = append(j.SQLite, journalDB{DB: dbPath, Backup: backup, Deletes: planned})
+	if err := j.save(); err != nil {
+		popLastJournalDB(j)
+		j.persistErr = err
+		return
+	}
+	journalBeforeActionHook()
+
 	db, err := sql.Open("sqlite", sqliteDSN(dbPath, false))
 	if err != nil {
+		popLastJournalDB(j)
+		if saveErr := j.save(); saveErr != nil {
+			j.persistErr = saveErr
+			return
+		}
 		res.Errors = append(res.Errors, ItemError{
 			Message: fmt.Sprintf("打开索引库 %s 失败: %v", dbPath, err),
 		})
@@ -546,6 +590,11 @@ func (c *Cleaner) trimSQLiteIndex(
 	db.SetMaxOpenConns(1)
 	if err := db.Ping(); err != nil {
 		db.Close()
+		popLastJournalDB(j)
+		if saveErr := j.save(); saveErr != nil {
+			j.persistErr = saveErr
+			return
+		}
 		res.Errors = append(res.Errors, ItemError{
 			Message: fmt.Sprintf("打开索引库 %s 失败: %v", dbPath, err),
 		})
@@ -556,9 +605,21 @@ func (c *Cleaner) trimSQLiteIndex(
 	rows, err := deleteSQLiteStore(db, store, ids)
 	if err != nil {
 		db.Close()
+		popLastJournalDB(j)
+		if saveErr := j.save(); saveErr != nil {
+			j.persistErr = saveErr
+			return
+		}
 		res.Errors = append(res.Errors, ItemError{
 			Message: fmt.Sprintf("裁剪索引库 %s 失败: %v", dbPath, err),
 		})
+		return
+	}
+	// 用实际删掉的表/ID 替换预写值（正常情况一致；不一致说明声明与实际不符）。
+	j.SQLite[len(j.SQLite)-1].Deletes = rows
+	if err := j.save(); err != nil {
+		db.Close()
+		j.persistErr = err
 		return
 	}
 
@@ -576,7 +637,6 @@ func (c *Cleaner) trimSQLiteIndex(
 			Message: fmt.Sprintf("VACUUM 索引库 %s 失败: %v", dbPath, vacuumErr),
 		})
 	}
-	j.SQLite = append(j.SQLite, journalDB{DB: dbPath, Backup: backup, Deletes: rows})
 }
 
 // quoteIdent 转义 SQLite 标识符。
@@ -585,4 +645,32 @@ func (c *Cleaner) trimSQLiteIndex(
 // 双引号内部再双写一个双引号是 SQL 标准的转义方式。
 func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// plannedJournalRows 在删行之前把 Store 声明翻译成「将要删哪些表、哪些 ID」。
+//
+// 撤销靠整库备份，Deletes 只是账本信息；提前写下来才能在崩溃窗口里回答
+// 「这个库本来要删什么」。Rows 声明是 `table:fkcol`，这里只取表名。
+func plannedJournalRows(store catalog.Store, ids []string) []journalRow {
+	if store.Table == "" || len(ids) == 0 {
+		return nil
+	}
+	rows := []journalRow{{Table: store.Table, IDs: append([]string(nil), ids...)}}
+	for _, declaration := range store.Rows {
+		table, _, ok := strings.Cut(declaration, ":")
+		if !ok || table == "" {
+			continue
+		}
+		rows = append(rows, journalRow{Table: table, IDs: append([]string(nil), ids...)})
+	}
+	return rows
+}
+
+// plannedPlanRows 汇总一条 plan 里所有 Store 的「计划删除」。
+func plannedPlanRows(plan *sqlitePlan) []journalRow {
+	var rows []journalRow
+	for _, store := range plan.stores {
+		rows = append(rows, plannedJournalRows(store, plan.ids)...)
+	}
+	return rows
 }

@@ -127,14 +127,37 @@ func (c *Cleaner) trimSharedIndexDB(
 		return
 	}
 
+	// 先记账、后裁剪：预写命中的表与 URI 并落盘，再逐表删。崩溃窗口里账本
+	// 已经带着这个库的备份与计划。
+	planned := make([]journalRow, 0, len(matched))
+	for _, table := range tables {
+		if len(matched[table]) > 0 {
+			planned = append(planned, journalRow{Table: table, IDs: matched[table]})
+		}
+	}
+	j.SQLite = append(j.SQLite, journalDB{DB: dbPath, Backup: backup, Deletes: planned})
+	if err := j.save(); err != nil {
+		popLastJournalDB(j)
+		j.persistErr = err
+		return
+	}
+	journalBeforeActionHook()
+
 	db, err = sql.Open("sqlite", sqliteDSN(dbPath, false))
+	if err == nil {
+		db.SetMaxOpenConns(1)
+	}
 	if err != nil {
+		popLastJournalDB(j)
+		if saveErr := j.save(); saveErr != nil {
+			j.persistErr = saveErr
+			return
+		}
 		res.Errors = append(res.Errors, ItemError{
 			Message: fmt.Sprintf("打开共享索引 %s 失败: %v", dbPath, err),
 		})
 		return
 	}
-	db.SetMaxOpenConns(1)
 	var rows []journalRow
 	for _, table := range tables {
 		values := matched[table]
@@ -149,8 +172,16 @@ func (c *Cleaner) trimSharedIndexDB(
 		}
 		rows = append(rows, journalRow{Table: table, IDs: values})
 	}
-	if len(rows) > 0 {
-		j.SQLite = append(j.SQLite, journalDB{DB: dbPath, Backup: backup, Deletes: rows})
+	// 用实际成功的表替换计划；一张都没成功就整条撤回。
+	if len(rows) == 0 {
+		popLastJournalDB(j)
+	} else {
+		j.SQLite[len(j.SQLite)-1].Deletes = rows
+	}
+	if err := j.save(); err != nil {
+		j.persistErr = err
+		db.Close()
+		return
 	}
 	before := fileSize(dbPath)
 	if _, err := db.Exec("VACUUM"); err != nil {

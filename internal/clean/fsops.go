@@ -83,39 +83,48 @@ func (c *Cleaner) backupFile(src, batchID string, namer *backupNamer) (string, e
 	return dest, nil
 }
 
-// moveToTrash 把一条路径挪进本批次的废纸篓目录。
+// reserveTrashName 在 trashRoot 里为 src 选一个不冲突的目标名（只算名字，
+// 不移动任何东西）。
 //
-// 真正的移动走 fsx.RenameUnder：从数据根的目录 fd 起逐层 openat(O_NOFOLLOW)
-// 下探，再用 renameat 换名，父目录在校验之后被换成符号链接也无法把移动重定向
-// 到数据根之外。跨卷（EXDEV）不降级成复制 —— 复制按路径解析，等于把刚闭合的
-// TOCTOU 又带回来；这种情况直接报错，让用户改用永久删除或换同卷废纸篓。
+// 拆成「预写 journal 用名字」与「真正移动」两步，是为了让删除顺序变成
+// 「账本先落盘、动作后执行」：崩溃窗口里 journal 已经能描述这次移动。
 //
 // 不直接沿用原文件名：同一个 Agent 的多个会话目录里可能都有 `session.json`，
 // 平铺到同一个批次目录必然撞名。撞名时加 `-2`、`-3`，而不是覆盖。
-func moveToTrash(home, src, trashRoot string) (string, error) {
+func reserveTrashName(trashRoot, src string) (name, dest string, err error) {
 	if err := os.MkdirAll(trashRoot, 0o700); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if _, err := os.Lstat(src); err != nil {
-		return "", fmt.Errorf("源路径不存在或不可访问 %s: %w", src, err)
+		return "", "", fmt.Errorf("源路径不存在或不可访问 %s: %w", src, err)
 	}
 	base := filepath.Base(filepath.Clean(src))
 	if base == "" || base == "." || base == string(filepath.Separator) {
 		base = "session"
 	}
-	name := base
-	dest := filepath.Join(trashRoot, name)
+	name = base
+	dest = filepath.Join(trashRoot, name)
 	for n := 2; pathExists(dest); n++ {
 		name = fmt.Sprintf("%s-%d", base, n)
 		dest = filepath.Join(trashRoot, name)
 	}
+	return name, dest, nil
+}
+
+// moveToTrashNamed 把 src 移动到 trashRoot/name。
+//
+// 真正的移动走 fsx.RenameUnder：从数据根的目录 fd 起逐层 openat(O_NOFOLLOW)
+// 下探，再用 renameat 换名，父目录在校验之后被换成符号链接也无法把移动重定向
+// 到数据根之外。跨卷（EXDEV）不降级成复制 —— 复制按路径解析，等于把刚闭合的
+// TOCTOU 又带回来；这种情况直接报错，让用户改用永久删除或换同卷废纸篓。
+func moveToTrashNamed(home, src, trashRoot, name string) error {
 	if err := fsx.RenameUnder(home, src, trashRoot, name); err != nil {
 		if errors.Is(err, fsx.ErrCrossDevice) {
-			return "", fmt.Errorf("移入废纸篓失败：%s 与废纸篓不在同一卷；请改用永久删除，或把废纸篓放到同一卷（%w）", src, err)
+			return fmt.Errorf("移入废纸篓失败：%s 与废纸篓不在同一卷；请改用永久删除，或把废纸篓放到同一卷（%w）", src, err)
 		}
-		return "", err
+		return err
 	}
-	return dest, nil
+	return nil
 }
 
 // movePath 先尝试 rename，失败再退回复制 + 删除。

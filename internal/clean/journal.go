@@ -58,6 +58,32 @@ func (j *journal) save() error {
 	return j.persist()
 }
 
+// journalBeforeActionHook 在「journal 已落盘、破坏性动作尚未执行」的瞬间被调用。
+//
+// 只给测试用：用来证明崩溃窗口里账本已经能描述将要发生的事（动作完成后进程
+// 立刻被 kill，撤销仍能依据磁盘上的 journal 进行）。生产路径是空函数。
+var journalBeforeActionHook = func() {}
+
+// popLast* 撤回最后一条记录。调用点都在单线程删除路径上（opMu 保护），
+// 并且刚 append 的一定是最后一条，所以不需要按内容查找。
+func popLastJournalMoved(j *journal) {
+	if n := len(j.Moved); n > 0 {
+		j.Moved = j.Moved[:n-1]
+	}
+}
+
+func popLastJournalIndex(j *journal) {
+	if n := len(j.Indexes); n > 0 {
+		j.Indexes = j.Indexes[:n-1]
+	}
+}
+
+func popLastJournalDB(j *journal) {
+	if n := len(j.SQLite); n > 0 {
+		j.SQLite = j.SQLite[:n-1]
+	}
+}
+
 type journalMoved struct {
 	Orig    string `json:"orig"`
 	Trashed string `json:"trashed"`

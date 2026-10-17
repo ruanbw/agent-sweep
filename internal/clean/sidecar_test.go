@@ -40,8 +40,12 @@ func TestSQLiteSessionRemovesSidecarDirs(t *testing.T) {
 
 	spec := catalog.Spec{
 		ID: "antigravity", Name: "Antigravity",
-		Roots:  []string{home},
-		Stores: []catalog.Store{{Kind: "sqlite", DB: "conv.db", Table: "conversation_summaries", IDCol: "conversation_id"}},
+		Roots: []string{home},
+		Stores: []catalog.Store{{
+			Kind: "sqlite", DB: "conv.db", Table: "conversation_summaries", IDCol: "conversation_id",
+			// 旁挂路径必须能由声明解释（与 builtin 里的 Antigravity 一致）。
+			Assoc: []string{"/brain/{id}"},
+		}},
 	}
 	cleaner := New(Options{
 		Mode:       ModePermanent,

@@ -506,13 +506,16 @@ func trashFileSession(
 	}
 
 	// start 之前的 Moved 条目属于先前的会话；回滚只能碰本次追加的区间。
+	//
+	// 顺序刻意改为「先记账、后动作」：先占一个不冲突的废纸篓名字并写进
+	// journal 落盘，再真正 rename。进程如果恰好死在 rename 之后、下一次落盘
+	// 之前，账本里已经有这条记录，撤销仍能把它挪回来；反过来（旧顺序）则
+	// 只剩一个无账可查的废纸篓副本。
 	start := len(j.Moved)
 	for i, path := range s.Paths {
-		dest, err := moveToTrash(home, path, trashRoot)
+		name, dest, err := reserveTrashName(trashRoot, path)
 		if err != nil {
 			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
-			// 预检没预测到的运行期失败（竞态、磁盘写满等）：尽力把本次会话
-			// 已经挪走的条目搬回去，并要求 journal 与磁盘现状一致。
 			if rollbackTrashSession(s.UID, j, start, res) {
 				if saveErr := writer.save(); saveErr != nil {
 					return false, saveErr
@@ -522,9 +525,26 @@ func trashFileSession(
 		}
 		j.Moved = append(j.Moved, journalMoved{Orig: path, Trashed: dest})
 		if err := writer.save(); err != nil {
-			// 只有已经处理完所有路径时，这条会话才算完整删除；
-			// 否则调用方不能把它计入 Result.Count。
+			popLastJournalMoved(j)
 			return i == len(s.Paths)-1, err
+		}
+		journalBeforeActionHook()
+		if err := moveToTrashNamed(home, path, trashRoot, name); err != nil {
+			// 动作没发生（RenameUnder 失败）：把刚预写的条目撤回并落盘，
+			// 账本与磁盘都回到「这次移动不存在」的状态，再走既有回滚。
+			popLastJournalMoved(j)
+			if saveErr := writer.save(); saveErr != nil {
+				return false, saveErr
+			}
+			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
+			// 预检没预测到的运行期失败（竞态、磁盘写满等）：尽力把本次会话
+			// 已经挪走的条目搬回去，并要求 journal 与磁盘现状一致。
+			if rollbackTrashSession(s.UID, j, start, res) {
+				if saveErr := writer.save(); saveErr != nil {
+					return false, saveErr
+				}
+			}
+			return false, nil
 		}
 	}
 	return true, nil
@@ -634,6 +654,7 @@ func preflightTrashMove(path string) error {
 // 签名由 sqlite.go 的调用点固定，不能返回 error；journal 写盘失败记录在
 // j.persistErr 上，Delete 在 SQLite 阶段结束后检查并停止后续破坏。
 func (c *Cleaner) deleteSidecars(
+	spec catalog.Spec,
 	s session.Session,
 	home, trashRoot string,
 	trashErr error,
@@ -652,20 +673,47 @@ func (c *Cleaner) deleteSidecars(
 			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
 			continue
 		}
+		// 与文件型会话同一套声明校验：旁挂路径必须能由该会话的 Store/Assoc
+		// 解释，否则同样不碰。
+		if len(spec.Stores) > 0 {
+			mainDir := ""
+			if len(s.Paths) > 0 {
+				mainDir = filepath.Dir(s.Paths[0])
+			}
+			if !pathDeclared(spec, home, mainDir, s.ID, path) {
+				res.Errors = append(res.Errors, ItemError{
+					UID:     s.UID,
+					Message: fmt.Sprintf("旁挂路径 %s 无法由 Agent %s 的 Store/Assoc 声明解释，已跳过", path, spec.ID),
+				})
+				continue
+			}
+		}
 		if c.opts.Mode == ModeTrash {
 			if trashErr != nil {
 				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: trashErr.Error()})
 				continue
 			}
-			dest, err := moveToTrash(home, path, trashRoot)
+			// 与 trashFileSession 相同：先预写 journal 再真正移动。
+			name, dest, err := reserveTrashName(trashRoot, path)
 			if err != nil {
 				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
 				continue
 			}
 			j.Moved = append(j.Moved, journalMoved{Orig: path, Trashed: dest})
 			if err := j.save(); err != nil {
+				popLastJournalMoved(j)
 				j.persistErr = err
 				return
+			}
+			journalBeforeActionHook()
+			if err := moveToTrashNamed(home, path, trashRoot, name); err != nil {
+				popLastJournalMoved(j)
+				if saveErr := j.save(); saveErr != nil {
+					j.persistErr = saveErr
+					return
+				}
+				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
+				continue
 			}
 			continue
 		}

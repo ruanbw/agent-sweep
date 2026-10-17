@@ -116,10 +116,23 @@ func (c *Cleaner) trimJSONIndex(
 			})
 			continue
 		}
+		// 先记账、后动刀：备份条目落盘之后才删/改文件，崩溃窗口里账本已经
+		// 知道这个索引被备份过。
 		j.Indexes = append(j.Indexes, journalBackup{Orig: path, Backup: backup})
+		if err := j.save(); err != nil {
+			popLastJournalIndex(j)
+			j.persistErr = err
+			return
+		}
+		journalBeforeActionHook()
 
 		if removeFile {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				popLastJournalIndex(j)
+				if saveErr := j.save(); saveErr != nil {
+					j.persistErr = saveErr
+					return
+				}
 				res.Errors = append(res.Errors, ItemError{
 					Message: fmt.Sprintf("删除已裁空的索引 %s 失败: %v", path, err),
 				})
@@ -127,6 +140,11 @@ func (c *Cleaner) trimJSONIndex(
 			continue
 		}
 		if err := fsx.WriteFileAtomic(path, out, info.Mode().Perm()); err != nil {
+			popLastJournalIndex(j)
+			if saveErr := j.save(); saveErr != nil {
+				j.persistErr = saveErr
+				return
+			}
 			res.Errors = append(res.Errors, ItemError{
 				Message: fmt.Sprintf("写回索引 %s 失败: %v", path, err),
 			})
