@@ -66,7 +66,10 @@ type Store struct {
 	// Glob 相对 Roots 的模式，支持 `*` 与 `**`。空表示根目录本身。
 	Glob string `json:"glob,omitempty"`
 	// SQLite 形态专用
-	DB       string `json:"db,omitempty"`    // 相对 Roots 的库文件
+	// DB 是相对 Roots 的库文件路径，允许 glob（`*` / `**`）：有些 Agent 每个
+	// 项目/工作区一个库文件。匹配到多个库时，每条会话记录自己的绝对库路径
+	// （session.Session.DBPath），删除按库分组进行。
+	DB       string `json:"db,omitempty"`
 	Table    string `json:"table,omitempty"` // 表名
 	IDCol    string `json:"idCol,omitempty"` // 主键列
 	TitleCol string `json:"titleCol,omitempty"`

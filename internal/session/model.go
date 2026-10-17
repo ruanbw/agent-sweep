@@ -27,6 +27,11 @@ type Session struct {
 	Paths []string `json:"paths"`
 	// Storage 标记来源形态：file / sqlite / dir。
 	Storage string `json:"storage"`
+	// DBPath 是 SQLite 型会话所在的库文件绝对路径。DB 声明成 glob 时同一个
+	// Agent 会有多个库，删除必须知道每一行来自哪个库；单库声明时也填，便于
+	// 校验。json:"-" 是因为它只给内部删除用 —— GUI 的 SessionView 不暴露它，
+	// /api/delete 只传 uid、服务端用内存里的完整 Session。
+	DBPath string `json:"-"`
 	// Active 表示会话可能正在被使用（有锁文件 / 属于当前进程），UI 会提示。
 	Active bool `json:"active"`
 }

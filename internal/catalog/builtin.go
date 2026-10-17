@@ -379,9 +379,11 @@ func Builtin() []Spec {
 				// rollout-*.jsonl 与 Codex 的 rollout 同构，标题解析可直接复用。
 				jsonlStore("cli/sessions/**/rollout-*.jsonl"),
 				jsonlStore("cli/archived_sessions/**/rollout-*.jsonl"),
-				// 新版会写 .jsonl.zst（正文整体 zstd 压缩）。声明 Compress 后
-				// 扫描只解前 1MB 抽标题；删除仍是整文件删除，不需要解压。
+				// 新版会写 .jsonl.zst（正文整体 zstd 压缩），归档目录同样会写。
+				// 声明 Compress 后扫描只解前 1MB 抽标题；删除仍是整文件删除，
+				// 不需要解压。
 				zstdJSONLStore("cli/sessions/**/rollout-*.jsonl.zst"),
+				zstdJSONLStore("cli/archived_sessions/**/rollout-*.jsonl.zst"),
 			},
 			Indexs: []Index{jsonlIndex("cli/history.jsonl", "session_id")},
 			Note:   "与 Trae IDE 是两套数据；cli/ 下是 Codex rollout 同构的 JSONL（含 .jsonl.zst）。",

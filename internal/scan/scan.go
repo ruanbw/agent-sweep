@@ -642,7 +642,71 @@ func resolveStorePath(home, rel string) (string, error) {
 	return path, nil
 }
 
-// scanSQLite 读表里的会话行。
+// resolveStoreDBs 把 Store 的 DB 声明展开成一组库文件路径。
+//
+// 不含通配符时等价于 resolveStorePath 的单路径；含 `*`/`?`/`[` 时按 glob 展开，
+// 只保留普通文件（目录不是库），每个结果都重新做一次包含性校验 —— glob 里也
+// 可能出现 `..`，不能让声明把扫描带到数据根之外。
+func resolveStoreDBs(home, pattern string) ([]string, error) {
+	path, err := resolveStorePath(home, pattern)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.ContainsAny(pattern, "*?[") {
+		return []string{path}, nil
+	}
+	candidates := fsx.Glob(home, pattern)
+	out := make([]string, 0, len(candidates))
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		// Lstat 而不是 Stat：符号链接不算普通文件，避免借链接读到数据根外的库。
+		info, err := os.Lstat(candidate)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		relative, err := filepath.Rel(home, candidate)
+		if err != nil {
+			return nil, fmt.Errorf("SQLite 库路径 %q 无法解析: %w", candidate, err)
+		}
+		if _, err := resolveStorePath(home, filepath.ToSlash(relative)); err != nil {
+			return nil, err
+		}
+		if seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		out = append(out, candidate)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// scanSQLite 读 Store 声明覆盖的所有库。
+//
+// 有些 Agent 每个项目/工作区一个库（DB 声明成 glob）；单个库读取失败不能吞掉
+// 其它库已经读到的会话，所以错误聚合返回、结果照常合并（与 partial_test 里
+// 「带已读到的行一起返回错误」的既有语义一致）。
+func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.Session, error) {
+	dbPaths, err := resolveStoreDBs(home, store.DB)
+	if err != nil {
+		return nil, err
+	}
+	var out []session.Session
+	var errs []error
+	for _, dbPath := range dbPaths {
+		items, err := scanSQLiteFile(spec, home, store, dbPath)
+		out = append(out, items...)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return out, errors.Join(errs...)
+	}
+	return out, nil
+}
+
+// scanSQLiteFile 读单个库里的会话行。
 //
 // 用 `SELECT *` 而不是拼列名：各版本的表结构会加减列，硬编码列名会让
 // 一个改名直接变成「扫描失败」。读出来再按配置的列名取值，取不到就退回候选列。
@@ -652,11 +716,7 @@ func resolveStorePath(home, rel string) (string, error) {
 // 永不返回，GUI 的扫描状态卡在 running，而 startScan 的幂等判断又拦住用户重试。
 // 第一层是 DSN 里的 busy_timeout（等锁的时长），第二层是这里的 ctx（查询总时长）。
 // 超时不算「0 条会话」：带着已读到的行一起返回错误，UI 才能说清是哪个 Agent 超时。
-func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.Session, error) {
-	dbPath, err := resolveStorePath(home, store.DB)
-	if err != nil {
-		return nil, err
-	}
+func scanSQLiteFile(spec catalog.Spec, home string, store catalog.Store, dbPath string) ([]session.Session, error) {
 	if !fsx.Exists(dbPath) {
 		return nil, nil
 	}
@@ -738,7 +798,9 @@ func scanSQLite(spec catalog.Spec, home string, store catalog.Store) ([]session.
 			Title:   stringValue(pick(values, titleChoice.index)),
 			Project: stringValue(pick(values, cwdChoice.index)),
 			Storage: session.StorageSQLite,
-			Bytes:   0, // SQLite 删行不释放空间，真实释放量在 clean 里按文件差算
+			// 多库声明下这一行来自哪个库只有扫描时知道；删除按它分组。
+			DBPath: dbPath,
+			Bytes:  0, // SQLite 删行不释放空间，真实释放量在 clean 里按文件差算
 		}
 		raw := pick(values, timeChoice.index)
 		if t, ok := sqliteTime(raw); ok {

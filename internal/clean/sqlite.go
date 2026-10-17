@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -22,6 +23,7 @@ import (
 type sqlitePlan struct {
 	path      string
 	stores    []catalog.Store
+	ids       []string // 落到这个库的会话 ID（按 DBPath 分组后）
 	backup    string
 	backupErr error
 	deleteErr error
@@ -35,6 +37,10 @@ type sqlitePlan struct {
 //   - 备份放在最前面，是因为删行不可撤销，而 VACUUM 之后旧页可能被复用；
 //   - 主表与子表放在同一事务，避免出现「主行没了、消息还在」的孤儿数据；
 //   - VACUUM 单独执行（SQLite 不允许在事务里 VACUUM），释放量按执行前后文件大小差算。
+//
+// 库按 session.DBPath 分组：DB 声明成 glob 时一个 Agent 会有多个库，每个库只
+// 备份/删一次，ID 集合取组内会话。没有 DBPath 的旧会话（旧 journal / 旧内存）
+// 退回「按 Store 声明的单路径」老逻辑，保证既有行为不变。
 func (c *Cleaner) deleteSQLiteSessions(
 	spec catalog.Spec,
 	home string,
@@ -49,57 +55,121 @@ func (c *Cleaner) deleteSQLiteSessions(
 ) {
 	var plans []*sqlitePlan
 	byPath := map[string]*sqlitePlan{}
-	for _, store := range spec.Stores {
-		if store.Kind != "sqlite" {
-			continue
+	warnedFallback := map[string]bool{}
+	// sessionPlans 记录每条会话落到哪几个库：错误归属与「这条是否算删成功」
+	// 都按它判断，而不是像旧实现那样对每条会话遍历全部 plan。
+	sessionPlans := map[string][]*sqlitePlan{}
+	var legacy []session.Session
+	valid := make([]session.Session, 0, len(sessions))
+
+	planFor := func(path string) *sqlitePlan {
+		if plan := byPath[path]; plan != nil {
+			return plan
 		}
-		path, err := resolveInHome(home, store.DB)
-		if err != nil {
-			for _, s := range sessions {
-				res.Errors = append(res.Errors, ItemError{
-					UID:     s.UID,
-					Message: fmt.Sprintf("SQLite 库路径不安全，已跳过: %v", err),
-				})
-			}
-			return
-		}
-		plan := byPath[path]
-		if plan == nil {
-			plan = &sqlitePlan{path: path}
-			byPath[path] = plan
-			plans = append(plans, plan)
-		}
-		plan.stores = append(plan.stores, store)
+		plan := &sqlitePlan{path: path}
+		byPath[path] = plan
+		plans = append(plans, plan)
+		return plan
 	}
-	if len(plans) == 0 {
-		for _, s := range sessions {
-			res.Errors = append(res.Errors, ItemError{
-				UID:     s.UID,
-				Message: "spec 没有声明可用的 SQLite 存储，无法删除该会话",
-			})
+	attach := func(s session.Session, plan *sqlitePlan) {
+		if !containsPlan(sessionPlans[s.UID], plan) {
+			sessionPlans[s.UID] = append(sessionPlans[s.UID], plan)
 		}
-		return
+		if !containsID(plan.ids, s.ID) {
+			plan.ids = append(plan.ids, s.ID)
+		}
 	}
 
-	ids := make([]string, 0, len(sessions))
-	seen := map[string]bool{}
 	for _, s := range sessions {
-		if s.ID == "" || seen[s.ID] {
+		if s.ID == "" {
+			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: "会话缺少 ID，无法定位 SQLite 行"})
 			continue
 		}
-		seen[s.ID] = true
-		ids = append(ids, s.ID)
-	}
-	if len(ids) == 0 {
-		// 一个可用的 ID 都没有时不要碰库：DELETE 空集合 + VACUUM 仍然会改文件，
-		// 既拿不到任何删除效果，又多了一份需要撤销的写入。
-		for _, s := range sessions {
-			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: "会话缺少 ID，无法定位 SQLite 行"})
+		valid = append(valid, s)
+		if s.DBPath == "" {
+			legacy = append(legacy, s)
+			continue
 		}
+		// DBPath 来自扫描结果，理论上一定在数据根内；这里再校验一次，因为
+		// journal/内存里的会话对象不是可信输入（撤销走的是另一条链，但删除
+		// 也不该把任意绝对路径当成库）。
+		relative, err := filepath.Rel(home, s.DBPath)
+		if err != nil {
+			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: fmt.Sprintf("会话记录的 SQLite 库路径无法解析，已跳过: %v", err)})
+			continue
+		}
+		path, err := resolveInHome(home, filepath.ToSlash(relative))
+		if err != nil {
+			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: fmt.Sprintf("会话记录的 SQLite 库路径不安全，已跳过: %v", err)})
+			continue
+		}
+		store, ok := storeForDBPath(spec, home, path)
+		if !ok {
+			fallback, hasFallback := firstSQLiteStore(spec)
+			if !hasFallback {
+				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: "spec 没有声明可用的 SQLite 存储，无法删除该会话"})
+				continue
+			}
+			store = fallback
+			if !warnedFallback[path] {
+				warnedFallback[path] = true
+				res.Errors = append(res.Errors, ItemError{Message: fmt.Sprintf(
+					"无法把数据库 %s 匹配到任何 sqlite Store 声明，已回退到 %s 删行", path, store.DB)})
+			}
+		}
+		plan := planFor(path)
+		plan.stores = appendStoreOnce(plan.stores, store)
+		attach(s, plan)
+	}
+
+	if len(legacy) > 0 {
+		hasSQLite := false
+		for _, store := range spec.Stores {
+			if store.Kind != "sqlite" {
+				continue
+			}
+			hasSQLite = true
+			// 旧会话不知道具体库：glob 声明下无法判断该删哪个库，只能如实报错，
+			// 而不是猜一个路径去删。
+			if containsGlobMeta(store.DB) {
+				for _, s := range legacy {
+					res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: fmt.Sprintf(
+						"Store 的 DB 声明 %q 是 glob，但会话没有记录具体库路径，无法删除该行", store.DB)})
+				}
+				continue
+			}
+			path, err := resolveInHome(home, store.DB)
+			if err != nil {
+				for _, s := range legacy {
+					res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: fmt.Sprintf("SQLite 库路径不安全，已跳过: %v", err)})
+				}
+				continue
+			}
+			plan := planFor(path)
+			plan.stores = appendStoreOnce(plan.stores, store)
+			for _, s := range legacy {
+				attach(s, plan)
+			}
+		}
+		if !hasSQLite {
+			for _, s := range legacy {
+				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: "spec 没有声明可用的 SQLite 存储，无法删除该会话"})
+			}
+		}
+	}
+
+	if len(valid) == 0 {
+		return
+	}
+	if len(plans) == 0 {
+		// 每条会话在分组阶段都已经记过错误，这里只收尾。
 		return
 	}
 
 	for _, plan := range plans {
+		if len(plan.ids) == 0 {
+			continue
+		}
 		if !fsx.Exists(plan.path) {
 			plan.backupErr = fmt.Errorf("库文件不存在: %s", plan.path)
 			continue
@@ -114,7 +184,7 @@ func (c *Cleaner) deleteSQLiteSessions(
 
 	for _, plan := range plans {
 		// 没备份成功就绝不打开写连接：这是本包最硬的一条纪律。
-		if plan.backupErr != nil {
+		if len(plan.ids) == 0 || plan.backupErr != nil {
 			continue
 		}
 		db, err := sql.Open("sqlite", sqliteDSN(plan.path, false))
@@ -130,7 +200,7 @@ func (c *Cleaner) deleteSQLiteSessions(
 		}
 
 		for _, store := range plan.stores {
-			rows, err := deleteSQLiteStore(db, store, ids)
+			rows, err := deleteSQLiteStore(db, store, plan.ids)
 			if err != nil {
 				plan.deleteErr = err
 				break
@@ -157,13 +227,10 @@ func (c *Cleaner) deleteSQLiteSessions(
 		}
 	}
 
-	for _, s := range sessions {
-		if s.ID == "" {
-			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: "会话缺少 ID，无法定位 SQLite 行"})
-			continue
-		}
-		failed := false
-		for _, plan := range plans {
+	for _, s := range valid {
+		group := sessionPlans[s.UID]
+		failed := len(group) == 0 // 分组阶段已经记过原因，不再重复报
+		for _, plan := range group {
 			if plan.backupErr != nil {
 				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: plan.backupErr.Error()})
 				failed = true
@@ -193,6 +260,102 @@ func (c *Cleaner) deleteSQLiteSessions(
 		addDeletedID(deleted, s)
 		addAgent(agents, s, spec)
 	}
+}
+
+// storeForDBPath 找出 DB 声明（允许 glob）能匹配这个库文件的那条 sqlite Store。
+//
+// 只做字符串匹配、不碰磁盘：删除时不该为了确认「这条会话归哪个声明」再遍历
+// 一次文件系统。匹配不到时调用方回退到第一条 sqlite Store 并记 warning ——
+// 声明被改过的老批次仍能删，但用户会看到原因。
+func storeForDBPath(spec catalog.Spec, home, dbPath string) (catalog.Store, bool) {
+	relative, err := filepath.Rel(home, dbPath)
+	if err != nil {
+		return catalog.Store{}, false
+	}
+	rel := filepath.ToSlash(relative)
+	for _, store := range spec.Stores {
+		if store.Kind != "sqlite" || store.DB == "" {
+			continue
+		}
+		pattern := filepath.ToSlash(strings.TrimPrefix(store.DB, "./"))
+		if matchDBPattern(pattern, rel) {
+			return store, true
+		}
+	}
+	return catalog.Store{}, false
+}
+
+// matchDBPattern 判断相对库路径是否匹配声明，支持 `*` / `?` / `[]` 与 `**`。
+func matchDBPattern(pattern, rel string) bool {
+	return matchDBPatternParts(strings.Split(pattern, "/"), strings.Split(rel, "/"))
+}
+
+func matchDBPatternParts(pattern, rel []string) bool {
+	if len(pattern) == 0 {
+		return len(rel) == 0
+	}
+	if pattern[0] == "**" {
+		for i := 0; i <= len(rel); i++ {
+			if matchDBPatternParts(pattern[1:], rel[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(rel) == 0 {
+		return false
+	}
+	ok, err := path.Match(pattern[0], rel[0])
+	if err != nil || !ok {
+		return false
+	}
+	return matchDBPatternParts(pattern[1:], rel[1:])
+}
+
+func containsGlobMeta(pattern string) bool {
+	return strings.ContainsAny(pattern, "*?[")
+}
+
+func firstSQLiteStore(spec catalog.Spec) (catalog.Store, bool) {
+	for _, store := range spec.Stores {
+		if store.Kind == "sqlite" {
+			return store, true
+		}
+	}
+	return catalog.Store{}, false
+}
+
+func appendStoreOnce(stores []catalog.Store, store catalog.Store) []catalog.Store {
+	for _, existing := range stores {
+		if sameStore(existing, store) {
+			return stores
+		}
+	}
+	return append(stores, store)
+}
+
+func sameStore(a, b catalog.Store) bool {
+	return a.Kind == b.Kind && a.DB == b.DB && a.Table == b.Table && a.IDCol == b.IDCol &&
+		a.TitleCol == b.TitleCol && a.TimeCol == b.TimeCol && a.CWDCol == b.CWDCol &&
+		a.Compress == b.Compress && strings.Join(a.Rows, "\x00") == strings.Join(b.Rows, "\x00")
+}
+
+func containsID(ids []string, id string) bool {
+	for _, existing := range ids {
+		if existing == id {
+			return true
+		}
+	}
+	return false
+}
+
+func containsPlan(plans []*sqlitePlan, target *sqlitePlan) bool {
+	for _, plan := range plans {
+		if plan == target {
+			return true
+		}
+	}
+	return false
 }
 
 // openDSN 拼出写连接（备份 checkpoint / 删行 / VACUUM）的 DSN。
