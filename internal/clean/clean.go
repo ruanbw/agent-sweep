@@ -95,7 +95,15 @@ var opMu sync.Mutex
 //
 // 删除一批会话通常是毫秒到几秒级（要移文件、改索引、偶尔 VACUUM）。5 秒足够盖住
 // 正常情况，又不至于让用户以为界面卡死。超时不算「可以继续」，而是明确失败。
-const processLockTimeout = 5 * time.Second
+//
+// 做成变量而不是常量，只为了测试能把它调短：否则每验证一次「被占用 → 超时」都要
+// 真的等满 5 秒，一个用例就能把整包的测试时间拖长数秒。之所以不经 Options 传，
+// 是因为 Undo 的调用点在 journal.go；而这个上限对 Delete 与 Undo 是同一条语义，
+// 放在包内一处更不容易分叉。
+//
+// 生产代码只读不写。测试必须在任何加锁动作之前改，并在用例结束时复原；
+// 包内用例都是串行执行的（没有 t.Parallel），不存在并发写它的机会。
+var processLockTimeout = 5 * time.Second
 
 // processLock 是跨进程互斥的持有凭据。
 //
@@ -146,13 +154,19 @@ func acquireProcessLock(journalDir string) (*processLock, error) {
 	}
 }
 
-// release 释放跨进程锁。释放失败只意味着进程退出时会自动放开，不值得中断调用方。
+// release 释放跨进程锁，可重复调用。
+//
+// 幂等是有意义的：持有者结构本就不可重入，一旦 defer release 与显式 release
+// 同时存在（或测试顺手多调一次），第二次不能拿着一个已经关闭的 fd 去 flock。
+// 释放失败只意味着进程退出时会自动放开，不值得中断调用方。
 func (l *processLock) release() {
 	if l == nil || l.file == nil {
 		return
 	}
-	_ = unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
-	_ = l.file.Close()
+	file := l.file
+	l.file = nil
+	_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+	_ = file.Close()
 }
 
 // New 构造 Cleaner。空字段走安全默认值：
