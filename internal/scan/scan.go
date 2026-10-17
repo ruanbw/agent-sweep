@@ -165,31 +165,74 @@ func scanStore(spec catalog.Spec, home string, store catalog.Store) ([]session.S
 	}
 }
 
+// scanWorkers 是单个 Store 内同时解析的文件数。
+//
+// 取 16：文件解析是「读一小段 + 解析 JSON」的 IO 密集型工作，16 路足以把
+// 慢盘的空闲时间填满，又不会让 30 个 Agent（AllWithProgress 里 6 路并发）
+// 一次性开出几百个线程。注意这里限制的是**在飞的 goroutine 数**，不再只是
+// 「同时运行的函数数」：文件型 Store 动辄几万个文件，先 go 再抢信号量会把
+// 几万个 goroutine（连同各自的栈）一起压在内存里。
+const scanWorkers = 16
+
+// forEachFile 用固定大小的 worker 池遍历 files，fn 拿到的是原始下标。
+//
+// 池里只创建 min(workers, len(files)) 个 goroutine：任务从 jobs 里取，
+// 取完一个才取下一个，所以任意时刻在飞的 fn 至多是 workers 个。下标由
+// 调用方用来写 slots[i]，结果顺序因此与 files 完全一致 —— 调用方（以及
+// 更上层的排序/过滤）依赖这一点。
+//
+// fn 对每个文件都会被调用一次，包括调用方随后要 Stat 跳过的那些；
+// 「跳过」是 fn 自己的事，池不做二次过滤，避免把任务悄悄吞掉。
+func forEachFile(files []string, workers int, fn func(i int, path string)) {
+	if len(files) == 0 {
+		return
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(files) {
+		workers = len(files)
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				fn(i, files[i])
+			}
+		}()
+	}
+	for i := range files {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+}
+
 // scanFiles 处理「一个文件 = 一条会话」的两种形态（jsonl / json）。
 func scanFiles(spec catalog.Spec, home string, store catalog.Store, jsonl bool) ([]session.Session, error) {
 	files := fsx.Glob(home, store.Glob)
-	items := make([]session.Session, len(files))
-	sem := make(chan struct{}, 16)
-	var wg sync.WaitGroup
-	for i, file := range files {
+	// 用指针槽位而不是 make([]session.Session, len(files))：后者会为几万个
+	// 文件先分配一整片零值结构体，而真正解析成功的只是其中一部分。空槽位
+	// 也保留了「按下标写、按下标读」的顺序语义。
+	slots := make([]*session.Session, len(files))
+	forEachFile(files, scanWorkers, func(i int, file string) {
 		info, err := os.Stat(file)
 		if err != nil || info.IsDir() {
-			continue
+			// 现状语义：Stat 失败（含 glob 与 Stat 之间的删除、坏符号链接）
+			// 和目录都静默跳过，不中断其它文件的解析。
+			return
 		}
-		wg.Add(1)
-		go func(i int, file string, info os.FileInfo) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			items[i] = buildFileSession(spec, home, store, file, info, jsonl)
-		}(i, file, info)
-	}
-	wg.Wait()
+		item := buildFileSession(spec, home, store, file, info, jsonl)
+		slots[i] = &item
+	})
 
-	out := make([]session.Session, 0, len(items))
-	for _, item := range items {
-		if item.ID != "" {
-			out = append(out, item)
+	out := make([]session.Session, 0, len(slots))
+	for _, item := range slots {
+		if item != nil && item.ID != "" {
+			out = append(out, *item)
 		}
 	}
 	return out, nil
@@ -412,7 +455,7 @@ func sqliteQueryError(dbPath string, err error) error {
 		// 扩展错误码的高位是细分原因（如 SQLITE_BUSY_SNAPSHOT），主码看低 8 位。
 		switch sqliteErr.Code() & 0xff {
 		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
-			return fmt.Errorf("SQLite 库 %s 被其它进程占用（等待 %s 后仍读不到）: %w",
+			return fmt.Errorf("SQLite 库 %s 被其它进程占用（等待上限 %s）: %w",
 				filepath.Base(dbPath), sqliteBusyTimeout, err)
 		}
 	}
