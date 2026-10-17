@@ -390,57 +390,101 @@ func buildFileSessionWithNotices(spec catalog.Spec, home string, store catalog.S
 }
 
 // scanDirs 处理「一个子目录 = 一条会话」。
+//
+// 目录元数据的读取和 scanFiles 一样是 IO 密集型：每个目录最多试 7 个候选
+// 文件名、每个文件内部还要按需多读几轮。串行做这件事，几千个会话目录就是
+// 上万次串行 open/read，扫描时长随目录数线性增长（R24）。这里复用同一个
+// forEachFile worker 池（scanWorkers 路）并发读取，再用下标槽位按目录枚举
+// 顺序输出 —— One 里的去重依赖「同一 ID 先到先得」，顺序不能变。
+//
+// 每个 worker 只写自己的槽位，item 和 notices 都不跨 goroutine 共享，
+// 所以 applyAssoc 与 notices 收集不需要额外加锁。
 func scanDirs(spec catalog.Spec, home string, store catalog.Store) ([]session.Session, error) {
+	return scanDirsWith(spec, home, store, buildDirSession)
+}
+
+// dirSessionBuilder 把一个已确认是目录的条目转成会话及其提示。
+//
+// 抽成参数只是为了让测试能确定地观测 scanDirs 的并发派发（见
+// dirsparallel_test.go）；生产路径固定使用 buildDirSession。
+type dirSessionBuilder func(spec catalog.Spec, home string, store catalog.Store, dir string, info os.FileInfo) (session.Session, []scanNotice)
+
+func scanDirsWith(spec catalog.Spec, home string, store catalog.Store, build dirSessionBuilder) ([]session.Session, error) {
 	entries := fsx.Glob(home, store.Glob)
-	var out []session.Session
-	var notices []scanNotice
-	for _, dir := range entries {
+	// 与 scanFiles 相同的指针槽位：只有真正处理成功的目录才占一个结果，
+	// 空槽位保留「按下标写、按下标读」的顺序语义。
+	type dirSlot struct {
+		item    *session.Session
+		notices []scanNotice
+	}
+	slots := make([]dirSlot, len(entries))
+	forEachFile(entries, scanWorkers, func(i int, dir string) {
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
-			continue
+			// 现状语义：Stat 失败（含 glob 与 Stat 之间的删除、坏符号链接）
+			// 和普通文件都静默跳过，不中断其它目录。
+			return
 		}
-		id := filepath.Base(dir)
-		if match := uuidAtEnd.FindStringSubmatch(id); match != nil {
-			id = match[1]
-		}
-		meta := session.ReadMetaDir(dir)
-		title := meta.Title
-		project := meta.Project
-		updated := info.ModTime()
-		messages := meta.Messages
-		if !meta.Time.IsZero() {
-			updated = meta.Time
-		}
-		// 目录结构里没写项目时，从父目录名反推：Claude Code / DSH 都把
-		// `/Users/me/proj` 编码成 `--Users-me-proj--` 这种 mangled 名字。
-		// 这是有损的（路径里的 `-` 会被还原成 `/`），所以只在没有真实值时用。
-		if project == "" {
-			project = decodeProjectDir(filepath.Base(filepath.Dir(dir)))
-		}
+		item, notices := build(spec, home, store, dir, info)
+		slots[i] = dirSlot{item: &item, notices: notices}
+	})
 
-		item := session.Session{
-			ID:        id,
-			UID:       spec.ID + ":" + id,
-			AgentID:   spec.ID,
-			Title:     title,
-			Project:   project,
-			Bytes:     fsx.Size(dir),
-			Messages:  messages,
-			Storage:   session.StorageDir,
-			Paths:     []string{dir},
-			UpdatedAt: updated,
+	out := make([]session.Session, 0, len(slots))
+	var notices []scanNotice
+	for _, slot := range slots {
+		if slot.item != nil {
+			out = append(out, *slot.item)
 		}
-		if item.Title == "" {
-			item.Title = fallbackTitle(id)
+		for _, notice := range slot.notices {
+			addNotice(&notices, notice)
 		}
-		if item.Snippet == "" {
-			item.Snippet = item.Project
-		}
-		applyAssoc(home, dir, store.Assoc, id, &item, &notices)
-		item.Active = activeFromLock(sessionLockState(filepath.Join(dir, "session.lock")))
-		out = append(out, item)
 	}
 	return out, wrapScanNotices(notices, nil)
+}
+
+// buildDirSession 读取单个目录型会话的元数据与旁挂产物。
+func buildDirSession(spec catalog.Spec, home string, store catalog.Store, dir string, info os.FileInfo) (session.Session, []scanNotice) {
+	id := filepath.Base(dir)
+	if match := uuidAtEnd.FindStringSubmatch(id); match != nil {
+		id = match[1]
+	}
+	meta := session.ReadMetaDir(dir)
+	title := meta.Title
+	project := meta.Project
+	updated := info.ModTime()
+	messages := meta.Messages
+	if !meta.Time.IsZero() {
+		updated = meta.Time
+	}
+	// 目录结构里没写项目时，从父目录名反推：Claude Code / DSH 都把
+	// `/Users/me/proj` 编码成 `--Users-me-proj--` 这种 mangled 名字。
+	// 这是有损的（路径里的 `-` 会被还原成 `/`），所以只在没有真实值时用。
+	if project == "" {
+		project = decodeProjectDir(filepath.Base(filepath.Dir(dir)))
+	}
+
+	item := session.Session{
+		ID:        id,
+		UID:       spec.ID + ":" + id,
+		AgentID:   spec.ID,
+		Title:     title,
+		Project:   project,
+		Bytes:     fsx.Size(dir),
+		Messages:  messages,
+		Storage:   session.StorageDir,
+		Paths:     []string{dir},
+		UpdatedAt: updated,
+	}
+	if item.Title == "" {
+		item.Title = fallbackTitle(id)
+	}
+	if item.Snippet == "" {
+		item.Snippet = item.Project
+	}
+	var notices []scanNotice
+	applyAssoc(home, dir, store.Assoc, id, &item, &notices)
+	item.Active = activeFromLock(sessionLockState(filepath.Join(dir, "session.lock")))
+	return item, notices
 }
 
 // scanSQLite 读表里的会话行。
