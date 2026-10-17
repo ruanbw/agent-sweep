@@ -291,6 +291,22 @@ func (c *Cleaner) Delete(spec catalog.Spec, home string, sessions []session.Sess
 // 先校验全部路径再动手，而不是边校验边删：一条会话可能同时带正文和旁挂目录，
 // 如果第一个删了、第二个越界被拒，用户会得到一个半删状态，比整条拒绝更难解释。
 //
+// trash 模式下「任一条失败 = 整条会话失败」还不够：只逐条 move、失败后继续，
+// 会留下「前几条已在废纸篓、后几条还在原位」的中间态；UI 按整条失败展示，
+// 用户重新删除时前几条的源路径已经不存在，于是永远删不干净（R11）。这里用
+// 两道闸把整条会话做成一个事务：
+//
+//  1. 主方案是移动前预检（preflightTrashMove / preflightTrashRoot）：源存在、
+//     父目录可写可进入、废纸篓目录可用。预检不写磁盘，失败时整条会话原样不动，
+//     也不会像回滚那样产生二次破坏；代价是预检与真正的 rename 之间存在 TOCTOU
+//     窗口，覆盖不了磁盘写满、并发改动这类运行期错误。
+//  2. 兜底是失败回滚（rollbackTrashSession）：预检通过后仍可能在移动第 i 条时
+//     失败，此时把本次会话刚挪走的条目按相反顺序挪回去。回滚只是尽力而为，
+//     哪些条目最终留在废纸篓会逐条反映到 j.Moved，撤销账本不会说谎。
+//
+// 目标重名不需要预检：moveToTrash 自己用 -2/-3 递增避让；预检若先占一个名字，
+// 反而会和随后的真正移动之间制造新的竞态。
+//
 // 每成功移走/删掉一个路径就立刻落一次 journal：崩溃发生在这里时，已经离开原位的
 // 文件仍然在账本里。写盘失败返回 error，调用方必须停止整批删除。
 func (c *Cleaner) deleteFileSession(
@@ -321,29 +337,14 @@ func (c *Cleaner) deleteFileSession(
 		return false, nil
 	}
 
+	if c.opts.Mode == ModeTrash {
+		return trashFileSession(s, trashRoot, trashErr, j, res, writer)
+	}
+
+	// permanent 模式语义保持不变：没有废纸篓可回滚，逐条 RemoveAll，
+	// 失败的路径逐条记错，不影响其余路径。
 	ok := true
 	for i, path := range s.Paths {
-		if c.opts.Mode == ModeTrash {
-			if trashErr != nil {
-				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: trashErr.Error()})
-				ok = false
-				continue
-			}
-			dest, err := moveToTrash(path, trashRoot)
-			if err != nil {
-				res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
-				ok = false
-				continue
-			}
-			j.Moved = append(j.Moved, journalMoved{Orig: path, Trashed: dest})
-			if err := writer.save(); err != nil {
-				// 只有已经处理完所有路径时，这条会话才算完整删除；
-				// 否则调用方不能把它计入 Result.Count。
-				return ok && i == len(s.Paths)-1, err
-			}
-			continue
-		}
-
 		size := fsx.Size(path)
 		if err := os.RemoveAll(path); err != nil {
 			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
@@ -356,6 +357,161 @@ func (c *Cleaner) deleteFileSession(
 		}
 	}
 	return ok, nil
+}
+
+// trashFileSession 以「整条会话」为事务边界把 s.Paths 挪进废纸篓。
+//
+// 返回 false 表示这条会话没有完整挪走（Result.Count 不应 +1）；返回 error 只用于
+// journal 写盘失败，调用方据此停止整批删除。
+func trashFileSession(
+	s session.Session,
+	trashRoot string,
+	trashErr error,
+	j *journal,
+	res *Result,
+	writer *journalWriter,
+) (bool, error) {
+	if trashErr != nil {
+		res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: trashErr.Error()})
+		return false, nil
+	}
+	if err := preflightTrashRoot(trashRoot); err != nil {
+		res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
+		return false, nil
+	}
+
+	// 预检全部路径，任何一条不合格都在移动之前整条拒绝：这是「要么整条挪走、
+	// 要么原样不动」的主方案，也避免用户重新删除时面对已不存在的源路径。
+	bad := false
+	for _, path := range s.Paths {
+		if err := preflightTrashMove(path); err != nil {
+			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
+			bad = true
+		}
+	}
+	if bad {
+		return false, nil
+	}
+
+	// start 之前的 Moved 条目属于先前的会话；回滚只能碰本次追加的区间。
+	start := len(j.Moved)
+	for i, path := range s.Paths {
+		dest, err := moveToTrash(path, trashRoot)
+		if err != nil {
+			res.Errors = append(res.Errors, ItemError{UID: s.UID, Message: err.Error()})
+			// 预检没预测到的运行期失败（竞态、磁盘写满等）：尽力把本次会话
+			// 已经挪走的条目搬回去，并要求 journal 与磁盘现状一致。
+			if rollbackTrashSession(s.UID, j, start, res) {
+				if saveErr := writer.save(); saveErr != nil {
+					return false, saveErr
+				}
+			}
+			return false, nil
+		}
+		j.Moved = append(j.Moved, journalMoved{Orig: path, Trashed: dest})
+		if err := writer.save(); err != nil {
+			// 只有已经处理完所有路径时，这条会话才算完整删除；
+			// 否则调用方不能把它计入 Result.Count。
+			return i == len(s.Paths)-1, err
+		}
+	}
+	return true, nil
+}
+
+// rollbackTrashSession 尽力把本次会话已经挪进废纸篓的条目挪回原位。
+//
+// 只在预检没预测到的运行期失败后调用，因此它自己也可能失败；这里的原则是
+// 「不制造二次破坏，且 j.Moved 必须与磁盘一致」：
+//   - 副本已不在废纸篓：从 j.Moved 删掉，否则撤销会去搬一个不存在的文件；
+//   - 原位置已被占用：绝不覆盖（覆盖等于拿废纸篓副本覆盖用户新数据），
+//     副本确实还在废纸篓里，保留记录并由 Undo 的「目标已存在」分支处理；
+//   - 搬回成功：副本已经不在了，从 j.Moved 删掉。
+//
+// 返回值表示是否从 j.Moved 中删掉了条目；调用方据此决定是否需要重新落盘。
+func rollbackTrashSession(uid string, j *journal, start int, res *Result) bool {
+	pruned := false
+	for i := len(j.Moved) - 1; i >= start; i-- {
+		entry := j.Moved[i]
+		if entry.Orig == "" || entry.Trashed == "" {
+			// 记录本身不完整，没有可靠的原路径可搬；保留原地不动。
+			continue
+		}
+		if !pathExists(entry.Trashed) {
+			j.Moved = append(j.Moved[:i], j.Moved[i+1:]...)
+			pruned = true
+			continue
+		}
+		if pathExists(entry.Orig) {
+			res.Errors = append(res.Errors, ItemError{
+				UID:     uid,
+				Message: fmt.Sprintf("回滚 %s 失败：原位置已被占用，废纸篓副本保留在 %s", entry.Orig, entry.Trashed),
+			})
+			continue
+		}
+		if err := movePath(entry.Trashed, entry.Orig); err != nil {
+			res.Errors = append(res.Errors, ItemError{
+				UID:     uid,
+				Message: fmt.Sprintf("回滚 %s 失败，废纸篓副本保留在 %s: %v", entry.Orig, entry.Trashed, err),
+			})
+			continue
+		}
+		j.Moved = append(j.Moved[:i], j.Moved[i+1:]...)
+		pruned = true
+	}
+	return pruned
+}
+
+// preflightTrashRoot 确认本批次的废纸篓目录可写。
+//
+// Delete 已经 MkdirAll 过；这里再查一次是因为「目录建得出来」不等于「目录里
+// 放得进东西」。检查放在逐条预检之前：根目录不可写时没有必要为每条路径重复
+// 报一遍同样的错。
+func preflightTrashRoot(trashRoot string) error {
+	info, err := os.Stat(trashRoot)
+	if err != nil {
+		return fmt.Errorf("废纸篓目录不可访问 %s: %w", trashRoot, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("废纸篓路径不是目录: %s", trashRoot)
+	}
+	if perm := info.Mode().Perm(); perm&0o222 == 0 {
+		return fmt.Errorf("废纸篓目录不可写 %s（权限 %04o），整条会话保持不变", trashRoot, perm)
+	}
+	return nil
+}
+
+// preflightTrashMove 在真正 rename 之前判断一条路径是否可移动。
+//
+// 只做只读探测，不写磁盘：这是它比「先挪、失败再回滚」更安全的地方 —— 拒绝时
+// 用户数据连位置都没变，也没有第二次 move 的失败风险。
+//
+// 可写性用权限位判断，而不是在用户的数据目录里写一个探针文件：探针本身就会
+// 制造一次写入，在只读/权限异常时还可能留下残留，违背「整条会话原样不动」。
+// 代价是它偏保守（ACL 授予的写权限看不到），但误拒只是让用户看到一条错误，
+// 不会删掉任何东西，符合这里「宁可不动」的取舍。
+//
+// 目标重名不在这里处理：moveToTrash 会在真正落位时用 -2/-3 递增避让，预检
+// 提前占名反而会与随后的移动之间制造竞态。
+func preflightTrashMove(path string) error {
+	if _, err := os.Lstat(path); err != nil {
+		return fmt.Errorf("源路径不存在或不可访问 %s: %w", path, err)
+	}
+	parent := filepath.Dir(filepath.Clean(path))
+	info, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("父目录不可访问 %s: %w", parent, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("父目录不是目录: %s", parent)
+	}
+	perm := info.Mode().Perm()
+	if perm&0o222 == 0 {
+		return fmt.Errorf("父目录不可写 %s（权限 %04o），整条会话保持不变", parent, perm)
+	}
+	if perm&0o111 == 0 {
+		return fmt.Errorf("父目录不可进入 %s（权限 %04o），整条会话保持不变", parent, perm)
+	}
+	return nil
 }
 
 // deleteSidecars 删除 SQLite 型会话的旁挂文件 / 目录。
