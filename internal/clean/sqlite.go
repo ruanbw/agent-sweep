@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -187,6 +188,11 @@ func (c *Cleaner) deleteSQLiteSessions(
 			continue
 		}
 
+		// 在开始删行之前记录库的足迹（主库 + -wal + -shm）：只看主库会把
+		// 「删行落进 WAL、VACUUM 缩主库」这两种变化算漏。这是估算 —— Agent
+		// 并发写库时数字可能偏大或偏小，UI 不应把它当精确承诺。
+		before := sqliteFootprint(plan.path)
+
 		// 先记账、后删行：把「这个库、这些表、这些 ID 将被删」写进 journal 并
 		// 落盘，再执行事务。进程如果死在事务提交之后、下一次落盘之前，账本里
 		// 已经有这个库的备份与计划，撤销仍能整库覆盖回去。
@@ -245,12 +251,11 @@ func (c *Cleaner) deleteSQLiteSessions(
 			continue
 		}
 
-		before := fileSize(plan.path)
 		if _, err := db.Exec("VACUUM"); err != nil {
 			plan.vacuumErr = err
 		}
 		db.Close()
-		if freed := before - fileSize(plan.path); freed > 0 {
+		if freed := freedFromFootprint(before, sqliteFootprint(plan.path)); freed > 0 {
 			res.Freed += freed
 		}
 	}
@@ -673,4 +678,31 @@ func plannedPlanRows(plan *sqlitePlan) []journalRow {
 		rows = append(rows, plannedJournalRows(store, plan.ids)...)
 	}
 	return rows
+}
+
+// sqliteFootprint 返回库文件连同 -wal/-shm 的字节数之和。
+//
+// 只看主库会把两种真实变化算漏：删行先落进 WAL（主库没缩、WAL 涨了），
+// 或 VACUUM 缩了主库但 WAL 还占着空间。文件不存在按 0 计。
+func sqliteFootprint(path string) int64 {
+	var total int64
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Lstat(candidate)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		total += info.Size()
+	}
+	return total
+}
+
+// freedFromFootprint 把「动作前后的足迹」换成可上报的释放量。
+//
+// 只报正数：并发写入可能让 after > before，负的「释放了 -12KB」对用户没有
+// 意义，也容易让 UI 出现诡异常数。0 与正数直接返回。
+func freedFromFootprint(before, after int64) int64 {
+	if before <= after {
+		return 0
+	}
+	return before - after
 }

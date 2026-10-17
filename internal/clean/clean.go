@@ -51,6 +51,13 @@ type ItemError struct {
 }
 
 // Result 一次删除的汇总。
+//
+// Freed 与 Count 的口径刻意不同，对账时不要混着读：
+//   - Freed 是「实际删除成功的路径/库」的估算字节数（SQLite 按主库+WAL+SHM
+//     足迹估算，文件型按删除前 Size）。部分成功的会话，已删掉的那部分路径
+//     也会计入；trash 模式不移除数据，不计。
+//   - Count 是「完整删除」的会话条数。一条会话只要有一个路径没删成功，
+//     就不计入 —— 用户重试时不必重新删已经没了的那部分。
 type Result struct {
 	BatchID string      `json:"batchId"`
 	Freed   int64       `json:"freed"`
@@ -455,6 +462,9 @@ func (c *Cleaner) deleteFileSession(
 
 	// permanent 模式语义保持不变：没有废纸篓可回滚，逐条删除，失败的路径
 	// 逐条记错，不影响其余路径。删除走 fd 相对操作，避免校验之后被换链。
+	//
+	// 记账口径：Freed 按「路径」累加（删成功一条加一条），Count 由调用方按
+	// 「整条会话是否全部路径成功」+1。部分成功时两者本就不同口径，见 Result。
 	ok := true
 	for i, path := range s.Paths {
 		size := fsx.Size(path)
