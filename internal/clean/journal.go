@@ -231,11 +231,23 @@ func (c *Cleaner) Undo(batchID string) (UndoResult, error) {
 			out.Errors = append(out.Errors, fmt.Sprintf("拒绝恢复数据根之外的路径 %s: %v", entry.Orig, err))
 			continue
 		}
-		if pathExists(entry.Orig) {
+		// 「目标已存在」有两种含义，必须分开处理：
+		//
+		//   - 废纸篓副本也不在了：说明上一次撤销已经把这条挪回去了，现在是一次
+		//     重试。这是成功状态，要安静跳过，且绝不能记进 Errors —— 否则上一次
+		//     的旧失败会让重试永远带着错误，永远无法收敛到 Undone。
+		//   - 副本还在：目标被别的东西占了（用户新建了同名会话，或手工放回了一份），
+		//     此时挪回去就是覆盖，必须报错留给用户判断。
+		origExists := pathExists(entry.Orig)
+		trashedExists := pathExists(entry.Trashed)
+		if origExists && !trashedExists {
+			continue
+		}
+		if origExists {
 			out.Errors = append(out.Errors, fmt.Sprintf("目标已存在，跳过恢复: %s", entry.Orig))
 			continue
 		}
-		if !pathExists(entry.Trashed) {
+		if !trashedExists {
 			out.Errors = append(out.Errors, fmt.Sprintf("废纸篓副本不存在: %s", entry.Trashed))
 			continue
 		}
@@ -250,10 +262,18 @@ func (c *Cleaner) Undo(batchID string) (UndoResult, error) {
 		out.Restored++
 	}
 
-	// 即使部分恢复失败也标记 undone：已经覆盖回去的文件不会因为再跑一次而
-	// 变得更好，重复撤销只会得到一堆「目标已存在」。失败项通过 Errors 交还，
-	// 由用户决定是否手动处理。
-	j.Undone = true
+	// 只有整批成功才标记 undone。部分失败时保持 false：
+	//
+	// 失败的条目（磁盘满、权限、目标被占）在用户修好之后恰恰是可以重试的，而已经
+	// 成功的条目会在重试时被上面的「已恢复」/「副本不存在」分支安全跳过，所以重试
+	// 不会重复搬文件、也不会覆盖用户的新文件。如果照样置 true，Batches() 会把批次
+	// 当成「已撤销」而收掉撤销入口，用户就只能手工搬文件。
+	//
+	// 无论成功与否都要写回 journal：成功时要落盘 Undone，失败时也要把这一次的
+	// 部分进度留在磁盘上，下一次重试才有据可依。失败项通过 Errors 完整交还。
+	if len(out.Errors) == 0 {
+		j.Undone = true
+	}
 	if err := c.writeJournal(j); err != nil {
 		return out, fmt.Errorf("clean: 恢复完成但写回 journal 失败: %w", err)
 	}
