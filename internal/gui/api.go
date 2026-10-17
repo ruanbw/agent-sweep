@@ -3,6 +3,7 @@ package gui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -237,10 +238,28 @@ func (s *Service) handleScan(w http.ResponseWriter, r *http.Request) {
 // startScan 幂等：已经在扫描时什么都不做。
 // 重复触发在 UI 上很常见（用户连点、启动自动扫描 + 手动扫描），开两次是纯浪费。
 func (s *Service) startScan() {
-	s.mu.Lock()
-	if s.scanning {
-		s.mu.Unlock()
+	s.startScanWith(catalog.All, scan.AllWithProgress)
+}
+
+// scanRunner 是一次扫描的执行器。抽成参数只为让测试能注入 panic，
+// 生产路径只有 scan.AllWithProgress 一个实现。
+type scanRunner func(specs []catalog.Spec, progress func(done, total int, current string)) []scan.AgentResult
+
+// startScanWith 是 startScan 的实现，specs/run 可注入（测试用）。
+// 状态抢占在调用方 goroutine 里同步完成，保证紧接着的第二次调用一定看到 scanning=true。
+func (s *Service) startScanWith(specs func() []catalog.Spec, run scanRunner) {
+	if !s.beginScan() {
 		return
+	}
+	go s.runScan(specs, run)
+}
+
+// beginScan 抢占扫描状态，返回 false 表示已经有一次扫描在跑。
+func (s *Service) beginScan() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scanning {
+		return false
 	}
 	s.scanning = true
 	s.scan = ScanStatus{
@@ -248,65 +267,121 @@ func (s *Service) startScan() {
 		StartedAt: time.Now().Format(time.RFC3339),
 		Progress:  Progress{},
 	}
-	s.mu.Unlock()
+	return true
+}
 
-	go func() {
-		started := time.Now()
-		specs := catalog.All()
-		results := scan.AllWithProgress(specs, func(done, total int, current string) {
-			s.mu.Lock()
-			s.scan.Progress = Progress{Done: done, Total: total, Current: current}
-			s.mu.Unlock()
-		})
+// scanOutcome 是一次扫描的收尾数据。
+type scanOutcome struct {
+	status string
+	// applyResults 为 true 才整份替换扫描结果；异常路径保留上一次的数据，
+	// 半份结果覆盖内存比保留旧结果更糟。
+	applyResults bool
+	specs        []catalog.Spec
+	agents       []AgentView
+	sessions     []session.Session
+	byUID        map[string]session.Session
+	issues       []ScanIssue
+	// progress 为 nil 表示保留当前进度（异常路径），不谎报「全部完成」。
+	progress *Progress
+}
 
-		agents := make([]AgentView, 0, len(results))
-		var sessions []session.Session
-		byUID := map[string]session.Session{}
-		var issues []ScanIssue
-		for _, result := range results {
-			view := AgentView{
-				AgentID:      result.AgentID,
-				Name:         result.Name,
-				Group:        result.Group,
-				Vendor:       result.Vendor,
-				Installed:    result.Installed,
-				Home:         result.Home,
-				Roots:        result.Roots,
-				Note:         result.Note,
-				Custom:       result.Custom,
-				SessionCount: len(result.Sessions),
-				TotalBytes:   result.TotalBytes,
-				Error:        result.Err,
-			}
-			agents = append(agents, view)
-			if result.Err != "" {
-				issues = append(issues, ScanIssue{AgentID: result.AgentID, Message: result.Err})
-			}
-			for _, item := range result.Sessions {
-				sessions = append(sessions, item)
-				byUID[item.UID] = item
+// runScan 跑一次扫描。收尾放在 defer 里：正常结束、提前 return、panic
+// 都必须经过 finishScan，状态机不能让 scanning 永远停在 true。
+func (s *Service) runScan(specs func() []catalog.Spec, run scanRunner) {
+	started := time.Now()
+	// 默认按失败收尾：没有显式声明成功的退出，不能变成一次「done」。
+	outcome := scanOutcome{
+		status: "error",
+		issues: []ScanIssue{{Message: "扫描异常终止: 未完成"}},
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			// panic 不能被吞成成功：前端要看到一条错误，而不是旧数据 + done。
+			outcome = scanOutcome{
+				status: "error",
+				issues: []ScanIssue{{Message: fmt.Sprintf("扫描异常终止: %v", recovered)}},
 			}
 		}
-		sort.SliceStable(sessions, func(i, j int) bool {
-			return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)
-		})
-
-		s.mu.Lock()
-		s.specs = specs
-		s.agents = agents
-		s.sessions = sessions
-		s.byUID = byUID
-		s.scanning = false
-		s.scan = ScanStatus{
-			Status:     "done",
-			StartedAt:  s.scan.StartedAt,
-			FinishedAt: time.Now().Format(time.RFC3339),
-			DurationMs: time.Since(started).Milliseconds(),
-			Progress:   Progress{Done: len(results), Total: len(results)},
-			Issues:     orEmptyIssues(issues),
-		}
-		s.mu.Unlock()
+		s.finishScan(started, outcome)
 	}()
+
+	specsList := specs()
+	results := run(specsList, func(done, total int, current string) {
+		s.mu.Lock()
+		s.scan.Progress = Progress{Done: done, Total: total, Current: current}
+		s.mu.Unlock()
+	})
+
+	agents := make([]AgentView, 0, len(results))
+	var sessions []session.Session
+	byUID := map[string]session.Session{}
+	var issues []ScanIssue
+	for _, result := range results {
+		view := AgentView{
+			AgentID:      result.AgentID,
+			Name:         result.Name,
+			Group:        result.Group,
+			Vendor:       result.Vendor,
+			Installed:    result.Installed,
+			Home:         result.Home,
+			Roots:        result.Roots,
+			Note:         result.Note,
+			Custom:       result.Custom,
+			SessionCount: len(result.Sessions),
+			TotalBytes:   result.TotalBytes,
+			Error:        result.Err,
+		}
+		agents = append(agents, view)
+		if result.Err != "" {
+			issues = append(issues, ScanIssue{AgentID: result.AgentID, Message: result.Err})
+		}
+		for _, item := range result.Sessions {
+			sessions = append(sessions, item)
+			byUID[item.UID] = item
+		}
+	}
+	sort.SliceStable(sessions, func(i, j int) bool {
+		return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)
+	})
+
+	progress := Progress{Done: len(results), Total: len(results)}
+	outcome = scanOutcome{
+		status:       "done",
+		applyResults: true,
+		specs:        specsList,
+		agents:       agents,
+		sessions:     sessions,
+		byUID:        byUID,
+		issues:       issues,
+		progress:     &progress,
+	}
+}
+
+// finishScan 是扫描状态机唯一的出口：复位 scanning，并把 scan 收敛到终态。
+// 成功、panic、提前返回都必须经过它，否则前端会一直转圈且无法再发起扫描。
+func (s *Service) finishScan(started time.Time, outcome scanOutcome) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if outcome.applyResults {
+		s.specs = outcome.specs
+		s.agents = outcome.agents
+		s.sessions = outcome.sessions
+		s.byUID = outcome.byUID
+	}
+	progress := s.scan.Progress
+	if outcome.progress != nil {
+		progress = *outcome.progress
+	}
+	s.scanning = false
+	s.scan = ScanStatus{
+		Status:     outcome.status,
+		StartedAt:  s.scan.StartedAt,
+		FinishedAt: time.Now().Format(time.RFC3339),
+		DurationMs: time.Since(started).Milliseconds(),
+		Progress:   progress,
+		Issues:     orEmptyIssues(outcome.issues),
+	}
 }
 
 // MARK: - delete / undo
